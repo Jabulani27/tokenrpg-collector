@@ -37,7 +37,12 @@ login.
 Sign up at [tokenrpg.tinfoilhatsociety.cc](https://tokenrpg.tinfoilhatsociety.cc) and follow
 **Settings → Connect Claude Code**. Step 1 downloads this file to
 `~/.local/share/tokenrpg/tally_tokens.py`, step 2 uploads your history, and step 3 adds hooks so
-Claude Code uploads when a session starts or ends, and every ~10 minutes while you work.
+Claude Code uploads when a session starts or ends, and every few minutes while you work (after replies
+and tool calls, at most as often as the site's reply to each upload says, between 1 and 60 minutes).
+
+To start quickly, each upload keeps `log-cache.json` next to its config: the usage numbers it already read
+from each log file, so the next one reads only the files that changed (printing reads it, never writes it). It stays on your computer; delete it at any
+time, or run with `--no-cache`, and the next run reads every file again.
 
 Run it without `--push` to see exactly what it would send, as JSON, without sending anything:
 

@@ -17,6 +17,7 @@ import platform
 import shutil
 import sys
 import tempfile
+import time
 import unittest
 from unittest import mock
 
@@ -83,8 +84,15 @@ class Home(unittest.TestCase):
             json.dump({"url": "https://example.invalid", "token": "t"}, fh)
         self.server = {}                 # (device id, day) -> total, replaced per upload like /api/ingest
         self.uploads = []
+        self.every = None                # upload_every in the fake server's reply (None: not sent, as before v11)
+        # Every file the collector keeps beside its config, or a test would write the real one
+        # (until v11 the suite reset the player's own last-upload stamp; see test_harness_*).
         self.patches = [mock.patch.object(tt, "CONFIG", os.path.join(cfg, "config.json")),
                         mock.patch.object(tt, "DIRS_FILE", os.path.join(cfg, "claude-dirs.txt")),
+                        mock.patch.object(tt, "LAST_UPLOAD", os.path.join(cfg, "last-upload")),
+                        mock.patch.object(tt, "UPLOAD_EVERY", os.path.join(cfg, "upload-every")),
+                        mock.patch.object(tt, "CACHE", os.path.join(cfg, "log-cache.json")),
+                        mock.patch.object(tt, "UPLOAD_LOCK", os.path.join(cfg, "upload.lock")),
                         mock.patch.object(tt, "_machine_key", return_value="machine-k"),
                         mock.patch.object(tt, "http", side_effect=self.fake_http),
                         mock.patch.object(tt, "QUIET", False),
@@ -102,7 +110,10 @@ class Home(unittest.TestCase):
         self.uploads.append(body)
         for day, rec in body["days"].items():
             self.server[(body["device"]["id"], day)] = sum(rec[f] for f in ("input", "output", "cache_write", "cache_read"))
-        return 200, json.dumps({"accepted": len(body["days"]), "handle": "h", "device": body["device"]["label"]}).encode()
+        reply = {"accepted": len(body["days"]), "handle": "h", "device": body["device"]["label"]}
+        if self.every is not None:
+            reply["upload_every"] = self.every
+        return 200, json.dumps(reply).encode()
 
     def folder(self, name, account=None, records=(), session="s"):
         """A Claude Code folder. account: plan fields for its .claude.json (a CLAUDE_CONFIG_DIR
@@ -141,6 +152,24 @@ class Home(unittest.TestCase):
 
     def server_total(self):
         return sum(self.server.values())
+
+
+# Where the collector keeps its files when nothing is patched: the player's own folder.
+REAL_CONFIG_DIR = os.path.dirname(tt.CONFIG)
+
+
+class Harness(Home):
+    def test_harness_keeps_every_collector_file_in_the_throwaway_home(self):
+        for name in dir(tt):
+            value = getattr(tt, name)
+            if isinstance(value, str) and os.path.isabs(value):
+                self.assertFalse(value.startswith(REAL_CONFIG_DIR + os.sep), f"tt.{name} = {value}")
+        self.folder(".claude", {}, [record("a1")])
+        self.run_cli("--push", "--quiet")
+        cfg = os.path.dirname(tt.CONFIG)
+        self.assertTrue(cfg.startswith(self.home))
+        for f in ("last-upload", "log-cache.json"):
+            self.assertTrue(os.path.exists(os.path.join(cfg, f)), f)
 
 
 class KeepsV6Ids(Home):
@@ -539,6 +568,385 @@ class OddPaths(Home):
         self.assertEqual(tt.project_name(r"C:\Users\Pat\Clients\Acme Ltd\app"), "Acme Ltd/app")
         self.assertEqual(tt.project_name(r"C:\Users\Pat\Clients\Acme"), "Acme")
         self.assertEqual(tt.project_name("/home/pat/code/garden/app"), "garden/app")
+
+
+# ---------- collector v11: the server sets the rate, and only changed files are read ----------
+
+def usage_line(mid, ts="2026-10-01T12:00:00Z", model="claude-test", cwd="/x/proj", **counts):
+    u = {"input_tokens": 0, "output_tokens": 0, "cache_creation_input_tokens": 0, "cache_read_input_tokens": 1000}
+    u.update(counts)
+    return json.dumps({"timestamp": ts, "cwd": cwd, "message": {"id": mid, "model": model, "usage": u}})
+
+
+class ServerRate(Home):
+    """The hooks carry no number: throttled events upload at most every upload_every seconds,
+    the figure the last ingest reply carried (clamped 60..3600, 120 before the first)."""
+
+    def setUp(self):
+        super().setUp()
+        self.folder(".claude", {}, [record("a1")])
+
+    def stamp(self, age):
+        with open(tt.LAST_UPLOAD, "w") as fh:
+            fh.write(f"{time.time() - age:.3f}\n")
+
+    def ups(self, *argv):
+        return len(self.run_cli(*argv))
+
+    def test_default_until_the_server_says(self):
+        self.assertEqual(tt.upload_every(), 120)
+        self.stamp(100)
+        self.assertEqual(self.ups("--hook", "PostToolUse"), 0)
+        self.stamp(130)
+        self.assertEqual(self.ups("--hook", "PostToolUse"), 1)
+
+    def test_the_reply_sets_the_rate_and_it_is_kept(self):
+        self.every = 300
+        self.assertEqual(self.ups("--hook", "SessionStart"), 1)
+        self.assertEqual(tt.upload_every(), 300)
+        self.every = None                                   # a reply without it keeps the last one
+        self.stamp(200)
+        self.assertEqual(self.ups("--hook", "PostToolUse"), 0)
+        self.assertEqual(self.ups("--hook", "Stop"), 0)
+        self.stamp(301)
+        self.assertEqual(self.ups("--hook", "Stop"), 1)
+        self.assertEqual(tt.upload_every(), 300)
+
+    def test_clamped_and_only_whole_seconds(self):
+        for sent, kept in ((5, 60), (99999, 3600), (90, 90), ("600", 90), (True, 90), (12.5, 90), (None, 90)):
+            self.every = sent
+            self.run_cli("--push", "--quiet")
+            self.assertEqual(tt.upload_every(), kept, sent)
+        with open(tt.UPLOAD_EVERY, "w") as fh:
+            fh.write("garbage")
+        self.assertEqual(tt.upload_every(), 120)
+
+    def test_v9_reply_hook_follows_the_server_not_its_own_number(self):
+        # Lead decision 2026-10-19: --at-most-every N means "throttled", at the server's rate.
+        v9 = ("--push", "--quiet", "--at-most-every", "600")
+        self.stamp(130)
+        self.assertEqual(self.ups(*v9), 1)                  # 130 s < 600 s, but > 120 s: uploads
+        self.assertEqual(self.ups(*v9), 0)                  # seconds later: skipped
+        self.every = 3600
+        self.stamp(700)
+        self.assertEqual(self.ups("--push", "--quiet"), 1)  # a v9 SessionEnd: always, and brings 3600
+        self.stamp(700)
+        self.assertEqual(self.ups(*v9), 0)                  # 700 s > 600 s, but < 3600 s
+
+    def test_start_and_end_always_upload_and_reset_the_clock(self):
+        for event in ("SessionStart", "SessionEnd"):
+            self.assertEqual(self.ups("--hook", event), 1)
+        self.assertEqual(self.ups("--hook", "PostToolUse"), 0)
+
+    def test_an_event_we_do_not_know_yet_is_throttled(self):
+        self.stamp(10)
+        self.assertEqual(self.ups("--hook", "SomethingNew"), 0)
+
+    def test_what_the_fast_path_reads_from_the_command_line(self):
+        self.assertEqual(tt.hook_call(["--hook", "PostToolUse"]), (True, True))
+        self.assertEqual(tt.hook_call(["--hook=SessionEnd"]), (True, False))
+        self.assertEqual(tt.hook_call(["--hook", "Nope"]), (True, True))
+        self.assertEqual(tt.hook_call(["--push", "--quiet"]), (True, False))
+        self.assertEqual(tt.hook_call(["--push", "--quiet", "--at-most-every", "600"]), (True, True))
+        self.assertEqual(tt.hook_call(["--push"]), (False, False))              # by hand
+        self.assertEqual(tt.hook_call([]), (False, False))
+        self.assertEqual(tt.hook_call(["--install-hook", "--push", "--quiet"]), (False, False))
+
+    def test_a_clock_in_the_future_or_garbage_does_not_block(self):
+        self.stamp(-3600)
+        self.assertEqual(self.ups("--hook", "PostToolUse"), 1)
+        with open(tt.LAST_UPLOAD, "w") as fh:
+            fh.write("not a time")
+        self.assertEqual(self.ups("--hook", "PostToolUse"), 1)
+
+
+class ReviewFixes(Home):
+    """Each from the independent review of collector v11 (2026-10-19)."""
+
+    def setUp(self):
+        super().setUp()
+        self.folder(".claude", {}, [record("a1")])
+        self.cfg = os.path.dirname(tt.CONFIG)
+
+    def test_throttle_fails_closed_when_the_stamp_cannot_be_written(self):
+        blocker = os.path.join(self.cfg, "not-a-folder")
+        open(blocker, "w").close()
+        with mock.patch.object(tt, "LAST_UPLOAD", os.path.join(blocker, "last-upload")):
+            for _ in range(3):
+                self.assertEqual(len(self.run_cli("--hook", "PostToolUse")), 0)   # would be one per tool call
+            self.assertEqual(len(self.run_cli("--hook", "SessionEnd")), 1)        # start/end still upload
+            self.assertEqual(len(self.run_cli("--push")), 1)                     # and so does a hand run
+
+    def test_a_folder_named_only_by_claude_config_dir_has_its_own_throttle(self):
+        work = self.folder(".claude-work", {}, [record("w1")], session="w")
+        # ~/.claude's session uploads (work isn't in claude-dirs.txt, so it isn't in that upload)
+        self.assertEqual(len(self.run_cli("--hook", "SessionStart")), 1)          # ~/.claude alone
+        self.assertEqual(len(self.run_cli("--hook", "PostToolUse")), 0)          # same account: throttled
+        sent = self.run_cli("--hook", "PostToolUse", config_dir=work)           # the work account's session
+        self.assertEqual(len(sent), 2)                                          # not starved: it uploads, with work
+        self.assertEqual(len(self.run_cli("--hook", "PostToolUse", config_dir=work)), 0)   # then throttled itself
+        self.assertEqual(len(self.run_cli("--hook", "PostToolUse", config_dir=work + "/")), 0)   # one folder, one stamp
+        self.assertEqual(len(self.run_cli("--hook", "PostToolUse", config_dir=tt.default_dir())), 0)
+
+    def test_runs_log_keeps_start_end_and_problems_not_throttled_successes(self):
+        def log():
+            try:
+                with open(tt.LOG) as fh:
+                    return fh.read()
+            except OSError:
+                return ""
+        self.run_cli("--hook", "SessionStart")
+        self.assertEqual(log().count("Uploaded"), 1)
+        with open(tt.LAST_UPLOAD, "w") as fh:
+            fh.write(f"{time.time() - 500:.3f}\n")
+        self.assertEqual(len(self.run_cli("--hook", "PostToolUse")), 1)
+        self.assertEqual(log().count("Uploaded"), 1)                            # a mid-reply success: not logged
+        with open(tt.LAST_UPLOAD, "w") as fh:
+            fh.write(f"{time.time() - 500:.3f}\n")
+        with mock.patch.object(tt, "http", return_value=(500, b"oops")):
+            self.run_cli("--hook", "PostToolUse")
+        self.assertIn("upload refused (500)", log())                           # a mid-reply failure: logged
+        self.run_cli("--hook", "SessionEnd")
+        self.assertEqual(log().count("Uploaded"), 2)
+        self.assertGreaterEqual(tt.LOG_LINES, 1000)
+
+    def test_a_code_change_without_a_version_bump_starts_the_cache_afresh(self):
+        stamp = tt.LogCache().stamp()
+        with mock.patch.object(tt, "_OWN_SHA", ["0" * 64]):
+            self.assertNotEqual(tt.LogCache().stamp(), stamp)
+        with open(tt.HERE, "rb") as fh:
+            self.assertIn(hashlib.sha256(fh.read()).hexdigest(), stamp)
+
+    def test_saving_sweeps_our_stale_half_written_files_only(self):
+        names = ["log-cache.json.123.tmp", "last-upload.456.tmp", "upload-every.789.tmp", "last-upload-1a2b3c4d.9.tmp",
+                 "log-cache.json.321.tmp", "notes.123.tmp", "log-cache.json.abc.tmp", "claude-dirs.txt"]
+        for n in names:
+            open(os.path.join(self.cfg, n), "w").close()
+        old = time.time() - 3600
+        for n in names[:4] + names[5:]:
+            os.utime(os.path.join(self.cfg, n), (old, old))
+        self.run_cli("--push")
+        left = sorted(set(os.listdir(self.cfg)) & set(names))
+        self.assertEqual(left, sorted(["log-cache.json.321.tmp", "notes.123.tmp", "log-cache.json.abc.tmp",
+                                       "claude-dirs.txt"]))        # fresh, not ours, not a pid, not a tmp
+
+
+class LogCacheTests(Home):
+    """The cache changes how fast, never what: every payload equals a full read (--no-cache)."""
+
+    def setUp(self):
+        super().setUp()
+        self.base = self.folder(".claude", {})
+        os.unlink(os.path.join(self.base, "projects", "proj", "s.jsonl"))     # only the files written here
+        self.reads = []
+        real = tt.read_log
+        p = mock.patch.object(tt, "read_log", side_effect=lambda path, *a: self.reads.append(path) or real(path, *a))
+        p.start()
+        self.patches.append(p)
+
+    def write(self, session, lines, mode="w", sub="proj"):
+        path = os.path.join(self.base, "projects", sub, f"{session}.jsonl")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, mode) as fh:
+            fh.write("".join(line + "\n" for line in lines))
+        return path
+
+    def printed(self, *argv):
+        """What an upload with these flags sends (the days, as JSON text). Uploads keep the cache."""
+        sent = self.run_cli("--push", *argv)
+        return json.dumps([body["days"] for body in sent], indent=1)
+
+    def same(self, *argv):
+        """Cached and full read agree byte for byte; returns how many files the cached run read."""
+        self.reads.clear()
+        cached = self.printed("--days", "0", *argv)
+        n = len(self.reads)
+        self.assertEqual(cached, self.printed("--days", "0", "--no-cache", *argv))
+        return n
+
+    def corpus(self):
+        self.write("a", [usage_line("m1", model="opus", cwd="/w/alpha"), usage_line("m1", cache_read_input_tokens=5),
+                         usage_line("m2", "2026-10-02T23:30:00Z", model="sonnet", cwd="/w/beta/app"),
+                         '{"timestamp": "2026-10-01T12", "message": {"id": "bad", "usage": {}}} "usage"',
+                         usage_line("bad-ts", ts="not a time"), "not json but has \"usage\"",
+                         usage_line("syn", model="<synthetic>")])
+        self.write("b", [usage_line("m3", "2026-10-02T08:00:00Z", model="haiku", cwd="/w/gamma"),
+                         usage_line("m2", model="other"), usage_line("bad-ts", "2026-10-03T01:00:00Z")], sub="other")
+        self.write("c", [usage_line("m4", input_tokens=1.5, cwd="/w/delta")])        # a float: no fast path
+
+    def test_unchanged_files_are_not_read_again(self):
+        self.corpus()
+        self.assertEqual(self.same(), 3)                    # first run: every file
+        self.assertEqual(self.same(), 0)                    # nothing changed: none
+        self.assertEqual(self.same("--days", "28"), 0)
+        self.assertEqual(self.same("--no-projects"), 3)              # kept apart: no names in it
+        self.assertEqual(self.same("--no-projects"), 0)
+
+    def test_the_cache_keeps_project_names_never_paths_and_none_under_no_projects(self):
+        self.corpus()
+        self.same()
+        text = json.dumps(self.read_cache())
+        self.assertNotIn("/w/", text)                                 # no working directory
+        for name in ('"alpha"', '"beta/app"', '"gamma"'):
+            self.assertIn(name, text)
+        self.same("--no-projects")
+        text = json.dumps(self.read_cache())
+        for leak in ("/w/", "alpha", "beta", "gamma"):
+            self.assertNotIn(leak, text)
+
+    def test_a_cache_of_the_other_kind_is_not_used(self):
+        self.corpus()
+        full = tt.collect(0, projects=True, base=self.base)
+        nameless = tt.LogCache(projects=False)
+        tt.collect(0, projects=False, base=self.base, cache=nameless)
+        nameless.save()
+        self.assertEqual(tt.collect(0, projects=True, base=self.base, cache=nameless), full)
+
+    def test_a_cwd_project_name_cannot_read_fails_only_when_counted(self):
+        # A full read only names the projects of counted records, so an odd cwd on a duplicate
+        # must not break a cached run either.
+        self.write("a", [usage_line("m1"), json.dumps({"timestamp": "not a time", "cwd": ["odd"],     # never counted
+                         "message": {"id": "m2", "usage": {"input_tokens": 1}}})])
+        self.assertEqual(self.same(), 1)
+        self.assertEqual(self.same("--no-projects"), 1)
+
+    def test_a_changed_file_is_read_again_and_only_it(self):
+        self.corpus()
+        self.same()
+        path = self.write("b", [usage_line("m5", cache_read_input_tokens=7)], mode="a", sub="other")
+        self.assertEqual(self.same(), 1)
+        self.assertEqual(self.reads[-1], path) if self.reads else None
+        self.assertIn("m5", json.dumps(self.read_cache()))
+
+    def test_same_size_same_mtime_rewrite_is_still_seen(self):
+        path = self.write("a", [usage_line("m1", cache_read_input_tokens=1111)])
+        self.same()
+        st = os.stat(path)
+        self.write("a", [usage_line("m1", cache_read_input_tokens=2222)])          # same length
+        os.utime(path, ns=(st.st_atime_ns, st.st_mtime_ns))                        # mtime put back
+        self.assertEqual(os.path.getsize(path), st.st_size)
+        self.assertEqual(self.same(), 1)
+        self.assertIn('"cache_read": 2222', self.printed("--days", "0"))
+
+    def test_a_grown_file_is_read_again(self):
+        path = self.write("a", [usage_line("m1")])
+        self.same()
+        before = self.printed("--days", "0")
+        self.write("a", [usage_line("m9", cache_read_input_tokens=5)], mode="a")
+        os.utime(path, ns=(os.stat(path).st_atime_ns, os.stat(path).st_mtime_ns))
+        self.assertEqual(self.same(), 1)
+        self.assertNotEqual(self.printed("--days", "0"), before)
+
+    def test_a_message_in_two_files_counts_once_from_the_cache(self):
+        self.write("a", [usage_line("dup", cache_read_input_tokens=1000), usage_line("x", cache_read_input_tokens=1)])
+        self.write("b", [usage_line("dup", cache_read_input_tokens=1000), usage_line("y", cache_read_input_tokens=10)],
+                   sub="other")
+        self.same()
+        self.assertEqual(self.same(), 0)
+        day = json.loads(self.printed("--days", "0"))[0]["2026-10-01"]
+        self.assertEqual((day["cache_read"], day["messages"]), (1011, 3))
+
+    def test_a_message_in_two_folders_stays_with_the_earlier_from_the_cache(self):
+        self.write("a", [usage_line("m1"), usage_line("shared")])
+        work = self.folder(".claude-work", {}, [usage_line("m2"), usage_line("shared")], session="w")
+        tt._remember(work, True)
+        for _ in range(2):
+            seen, cache = set(), tt.LogCache()
+            per = [tt.collect(0, base=d, seen=seen, cache=cache) for d in tt.claude_dirs()]
+            cache.save()
+            self.assertEqual([p["2026-10-01"]["cache_read"] for p in per], [2000, 1000])
+
+    def test_a_deleted_file_leaves_the_cache(self):
+        self.corpus()
+        self.same()
+        os.unlink(os.path.join(self.base, "projects", "proj", "c.jsonl"))
+        self.same()
+        self.assertEqual(len(self.read_cache()), 2)
+
+    def read_cache(self):
+        with open(tt.CACHE, "rb") as fh:
+            return json.loads(fh.read().partition(b"\n")[2])
+
+    def test_a_cache_that_cannot_be_trusted_is_a_full_read(self):
+        self.corpus()
+        self.same()
+        with open(tt.CACHE, "rb") as fh:
+            good = fh.read()
+        head, _, body = good.partition(b"\n")
+        stamp = json.loads(head)
+        other = dict(stamp, stamp=[0] + stamp["stamp"][1:])
+        tampered = body.replace(b'"m3"', b'"m7"')
+        for bad in (b"", b"not json", good[:len(good) // 2], json.dumps(other).encode() + b"\n" + body,
+                    head + b"\n" + tampered, b'{"stamp": 1}\n{}', head + b"\n" + b"[]"):
+            with open(tt.CACHE, "wb") as fh:
+                fh.write(bad)
+            self.assertEqual(self.same(), 3, bad[:40])
+
+    def test_a_valid_cache_with_a_bad_entry_falls_back_and_never_crashes(self):
+        self.corpus()
+        self.same()
+        files = self.read_cache()
+        for entry in files.values():
+            entry["days"] = {"2026-10-01": [1, 2, 3]}          # wrong shape, checksum rewritten to match
+        body = json.dumps(files).encode()
+        head = json.dumps({"stamp": tt.LogCache().stamp(), "sha256": hashlib.sha256(body).hexdigest()}).encode()
+        with open(tt.CACHE, "wb") as fh:
+            fh.write(head + b"\n" + body)
+        self.assertEqual(self.printed("--days", "0"), self.printed("--days", "0", "--no-cache"))
+
+    def test_printing_reads_the_cache_but_never_writes_it(self):
+        self.corpus()
+        self.run_cli("--days", "0")                                   # a look, no upload
+        self.assertFalse(os.path.exists(tt.CACHE))
+        self.same()                                                   # an upload writes it
+        with open(tt.CACHE, "rb") as fh:
+            kept = fh.read()
+        self.reads.clear()
+        self.run_cli("--days", "0")
+        self.assertEqual(self.reads, [])                              # ...and printing uses it
+        before = self.out
+        self.write("a", [usage_line("m8")], mode="a")
+        self.run_cli("--days", "0")
+        after = self.out
+        self.run_cli("--days", "0", "--no-cache")
+        self.assertEqual(after, self.out)                             # the change is seen
+        self.assertNotEqual(after, before)
+        with open(tt.CACHE, "rb") as fh:
+            self.assertEqual(fh.read(), kept)                         # but not written
+
+    def test_the_cache_is_private_and_written_whole(self):
+        self.corpus()
+        self.same()
+        self.assertEqual(os.stat(tt.CACHE).st_mode & 0o777, 0o600)
+        self.assertEqual([f for f in os.listdir(os.path.dirname(tt.CACHE)) if ".tmp" in f], [])
+        mtime = os.stat(tt.CACHE).st_mtime_ns
+        self.same()
+        self.assertEqual(os.stat(tt.CACHE).st_mtime_ns, mtime)        # nothing changed: not rewritten
+
+    def test_a_partly_written_last_line_is_picked_up_once_complete(self):
+        path = self.write("a", [usage_line("m1")])
+        line = usage_line("m2", cache_read_input_tokens=5)
+        with open(path, "a") as fh:
+            fh.write(line[:30])                                        # Claude Code mid-write
+        self.same()
+        with open(path, "a") as fh:
+            fh.write(line[30:] + "\n")
+        self.assertEqual(self.same(), 1)
+        self.assertIn('"cache_read": 1005', self.printed("--days", "0"))
+
+    def test_fast_path_equals_record_by_record_on_many_keys(self):
+        lines = [usage_line(f"k{i}", f"2026-10-0{1 + i % 3}T{i % 24:02d}:00:00Z", model=f"m{i % 4}",
+                            cwd=f"/w/p{i % 5}/{'app' if i % 2 else 'x'}", input_tokens=i, output_tokens=2 * i)
+                 for i in range(60)]
+        self.write("a", lines[:30])
+        self.write("b", lines[30:], sub="z")
+        self.same()
+        self.reads.clear()
+        cached = self.printed("--days", "0")
+        self.assertEqual(self.reads, [])
+        with mock.patch.object(tt, "summarise", return_value=None):          # force record by record
+            os.unlink(tt.CACHE)
+            self.assertEqual(self.printed("--days", "0"), cached)
 
 
 if __name__ == "__main__":

@@ -15,40 +15,183 @@ message content. Standard library only, so a friend can drop the single file any
   tally_tokens.py --install-hook  make Claude Code upload automatically (edits each folder's settings.json)
   tally_tokens.py --add-dir DIR   also count a Claude Code folder kept somewhere unusual
                                   (one on a Windows drive, /mnt/..., is read but never given hooks)
+  tally_tokens.py --hook EVENT    what the hooks run: upload, at most as often as the server says
 
 Days are local time. Streaming writes a message more than once, so usage is
 de-duplicated on message id. The default 28-day window stays inside Claude Code's
-30-day log cleanup, so a partly deleted day is never sent over a complete one.
+30-day log cleanup, so a partly deleted day is never sent over a complete one. Files
+unchanged since the last upload are not read again (log-cache.json beside the config,
+written by uploads only; printing reads it but never writes it).
 """
-import argparse
-import glob
-import hashlib
-import json
 import os
-import platform
-import shlex
-import shutil
-import ssl
-import subprocess
 import sys
 import time
-import urllib.error
-import urllib.request
-from collections import defaultdict
-from datetime import datetime, timedelta
 
-VERSION = 10  # bump on every change; the server tells older copies to update themselves
+try:
+    import fcntl
+except ImportError:                  # not on native Windows, which isn't supported anyway
+    fcntl = None
+
+VERSION = 11  # bump on every change; the server tells older copies to update themselves
 USER_AGENT = f"tokenrpg-collector/{VERSION} (+https://tokenrpg.tinfoilhatsociety.cc)"
 HERE = os.path.abspath(__file__)
 LOG = os.path.join(os.path.dirname(HERE), "runs.log")
 CONFIG = os.environ.get("TOKENRPG_CONFIG") or os.path.expanduser("~/.config/tokenrpg/config.json")
 # Folders added with --add-dir. Not in config.json, because step 1 rewrites that file.
 DIRS_FILE = os.path.join(os.path.dirname(CONFIG), "claude-dirs.txt")
-# When the last upload started; the after-each-reply hook skips if it is recent.
+# When the last upload started; a throttled hook skips if it is recent. One per account folder
+# named by CLAUDE_CONFIG_DIR (see stamp_file), so one account's uploads never starve another's.
 LAST_UPLOAD = os.path.join(os.path.dirname(CONFIG), "last-upload")
-# The Claude Code events that upload, and how often at most (seconds). Stop fires after every
-# reply, so it is throttled; a session's start and end always upload.
-HOOK_EVENTS = {"SessionStart": None, "SessionEnd": None, "Stop": 600}
+# Held by an upload from reading the logs until its reply is in, so uploads land in the order
+# they read: a slow one can never arrive after a later one and put older numbers back.
+UPLOAD_LOCK = os.path.join(os.path.dirname(CONFIG), "upload.lock")
+# How often throttled hooks upload at most, in seconds: the server sends it with every upload
+# ("upload_every") and it is kept here, so the rate changes on the server's side only.
+UPLOAD_EVERY = os.path.join(os.path.dirname(CONFIG), "upload-every")
+DEFAULT_EVERY, MIN_EVERY, MAX_EVERY = 120, 60, 3600
+# Each log file's usage records as last read (path, size, times, inode), so an upload re-reads
+# only the files that changed.
+CACHE = os.path.join(os.path.dirname(CONFIG), "log-cache.json")
+# The Claude Code events that upload, and whether each is throttled to the server's rate. Stop
+# fires after every reply and PostToolUse after every tool call, so also during one long reply;
+# a session's start and end always upload. The hook commands carry no number.
+HOOK_EVENTS = {"SessionStart": False, "SessionEnd": False, "Stop": True, "PostToolUse": True}
+MID_TURN = "PostToolUse"             # the one that fires during a long reply (collector v11)
+
+
+# ---------- the throttle: runs before the imports below, so a skipped hook costs ~30 ms ----------
+
+def upload_every():
+    """The server's rate (seconds), clamped; DEFAULT_EVERY until the first upload brings one."""
+    try:
+        with open(UPLOAD_EVERY) as fh:
+            return min(MAX_EVERY, max(MIN_EVERY, int(fh.read().strip())))
+    except (OSError, ValueError):
+        return DEFAULT_EVERY
+
+
+def stamp_file():
+    """LAST_UPLOAD, or for a session whose CLAUDE_CONFIG_DIR is another folder, a stamp of its
+    own. Such a folder may be counted only through that variable (it is not in claude-dirs.txt),
+    so only its own sessions upload it; with one shared stamp, ~/.claude's uploads kept it waiting."""
+    env = os.environ.get("CLAUDE_CONFIG_DIR") or ""
+    if not env:
+        return LAST_UPLOAD
+    real = os.path.realpath(os.path.expanduser(env))
+    if real == os.path.realpath(os.path.expanduser("~/.claude")):
+        return LAST_UPLOAD
+    import zlib                      # a C module: cheap, unlike hashlib
+    return f"{LAST_UPLOAD}-{zlib.crc32(real.encode('utf-8', 'surrogateescape')):08x}"
+
+
+def uploaded_within(seconds):
+    """True if an upload started less than `seconds` ago. A stamp up to a minute ahead is
+    jitter and counts as recent; further ahead (the clock was moved back) counts as long ago,
+    so a wrong clock never stops uploads."""
+    try:
+        with open(stamp_file()) as fh:
+            age = time.time() - float(fh.read().strip())
+    except (OSError, ValueError):
+        return False
+    return -60 <= age < seconds
+
+
+def mark_upload():
+    """Record that an upload is starting; True if the stamp was written. Every upload marks it,
+    so the throttled hooks also skip right after a session's start or end upload."""
+    path = stamp_file()
+    tmp = f"{path}.{os.getpid()}.tmp"
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(tmp, "w") as fh:
+            fh.write(f"{time.time():.3f}\n")   # not rounded: a rounded-up stamp reads as the future
+        os.replace(tmp, path)
+        return True
+    except OSError:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        return False
+
+
+def claim_upload(throttled):
+    """Check the throttle and mark the upload as one step, under a lock: tool calls run in
+    parallel, and two hooks firing together must not both upload. False = skip this one.
+    A throttled call whose stamp can't be written (a read-only folder) is skipped too, or every
+    tool call would upload; a session's start and end still upload."""
+    lock = None
+    try:
+        if fcntl:
+            os.makedirs(os.path.dirname(LAST_UPLOAD), exist_ok=True)
+            lock = open(stamp_file() + ".lock", "a")
+            fcntl.flock(lock, fcntl.LOCK_EX)
+    except OSError:
+        lock = None                  # no lock is better than no upload
+    try:
+        if throttled and uploaded_within(upload_every()):
+            return False
+        return mark_upload() or not throttled
+    finally:
+        if lock:
+            lock.close()
+
+
+def hook_call(argv):
+    """(is this a hook run, is it throttled), read from the command line before argparse is
+    loaded. v11 hooks run --hook EVENT. Older ones run --push --quiet, the after-each-reply one
+    with --at-most-every N: that N is ignored and the server's rate applies (v11), which changes
+    how often they upload, never what."""
+    if "--install-hook" in argv or "--add-dir" in argv:
+        return False, False
+    for i, arg in enumerate(argv):
+        if arg == "--hook" or arg.startswith("--hook="):
+            event = arg[7:] if arg.startswith("--hook=") else (argv[i + 1] if i + 1 < len(argv) else "")
+            return True, HOOK_EVENTS.get(event, True)      # an event we don't know yet: throttled
+    if "--push" in argv and "--quiet" in argv:
+        return True, any(a == "--at-most-every" or a.startswith("--at-most-every=") for a in argv)
+    return False, False
+
+
+CLAIMED = False                      # set when the fast path below has already claimed the upload
+
+
+def hook_fast_path(argv):
+    """A hook run, before anything heavy is imported: a throttled call that isn't due exits here.
+    One that is due hands the upload to a detached child and returns, so Claude Code never
+    waits for it (and a Claude Code that exits can't take the upload down with it)."""
+    global CLAIMED
+    hook, throttled = hook_call(argv)
+    if not hook:
+        return
+    if not claim_upload(throttled):
+        sys.exit(0)
+    CLAIMED = True
+    try:
+        if os.fork():
+            os._exit(0)              # the hook itself: done
+        os.setsid()                  # the upload: its own session, nothing to wait on
+        null = os.open(os.devnull, os.O_RDWR)
+        for fd in (0, 1, 2):
+            os.dup2(null, fd)
+    except (AttributeError, OSError):
+        pass                         # no fork: upload in this process, as before v11
+
+
+if __name__ == "__main__":
+    hook_fast_path(sys.argv[1:])
+
+# The rest, after the fast path. What only an upload or setup needs (urllib, ssl, subprocess,
+# platform, shutil) is imported where it is used, so printing or a cached upload starts quicker.
+import argparse  # noqa: E402
+import glob  # noqa: E402
+import hashlib  # noqa: E402
+import json  # noqa: E402
+import re  # noqa: E402
+import shlex  # noqa: E402
+from collections import defaultdict  # noqa: E402
+from datetime import datetime, timedelta  # noqa: E402
+
 # Where WSL mounts the Windows drives (/mnt/c, /mnt/d...). A Claude folder in there belongs to
 # Windows's Claude Code, which would try to run our Linux hook command, so it is read but never
 # given hooks. Only on WSL: on plain Linux, /mnt/<anything> is an ordinary disk.
@@ -81,9 +224,97 @@ def new_day():
             "models": defaultdict(int), "hours": defaultdict(int), "projects": defaultdict(int)}
 
 
-def collect(window_days, projects=True, base=None, seen=None):
+BAD_CWD = [0]    # stands for a cwd project_name() fails on: it fails on this too, at the same record
+
+
+def read_log(path, projects=True):
+    """One log file's usage records, in file order: [message id, local day, local hour, the four
+    FIELDS counts, model, project]. Streaming writes a message more than once; only its first
+    complete line is kept, the one a single pass over every file would count. A timestamp that
+    doesn't parse leaves day and hour None: its id still counts as seen. The project is
+    project_name(cwd), never the path itself, and None under --no-projects."""
+    out, mine = [], set()
+    with open(path, errors="ignore") as fh:
+        for line in fh:
+            if '"usage"' not in line:
+                continue
+            try:
+                rec = json.loads(line)
+            except ValueError:
+                continue
+            msg = rec.get("message") or {}
+            u, mid, ts = msg.get("usage"), msg.get("id"), rec.get("timestamp")
+            if not (isinstance(u, dict) and mid and ts) or mid in mine:
+                continue
+            mine.add(mid)
+            try:
+                local = datetime.fromisoformat(ts.replace("Z", "+00:00")).astimezone()
+                day, hour = local.date().isoformat(), local.hour
+            except ValueError:
+                day = hour = None
+            project = None
+            if projects:
+                try:
+                    project = project_name(rec.get("cwd"))
+                except (AttributeError, TypeError):
+                    project = BAD_CWD    # a full read fails only if this record is counted
+            out.append([mid, day, hour, [u.get(theirs) or 0 for theirs in FIELDS.values()],
+                        msg.get("model"), project])
+    return out
+
+
+def summarise(records):
+    """One file's records added up per day, exactly as _collect adds them when none of them is
+    skipped: {day: [input, output, cache_write, cache_read, messages, models, hours, projects]},
+    the last three as [key, tokens] pairs in first-seen order (the order the upload's keys come
+    out in). None when a count isn't a plain int, since floats added in another order could
+    round differently; such a file is always added record by record."""
+    days = {}
+    try:
+        for mid, key, hour, counts, model, project in records:
+            if key is None:
+                continue
+            if any(type(v) is not int for v in counts) or not isinstance(project, (str, type(None))):
+                return None
+            d = days.get(key)
+            if d is None:
+                d = days[key] = [0, 0, 0, 0, 0, {}, {}, {}]
+            d[0] += counts[0]
+            d[1] += counts[1]
+            d[2] += counts[2]
+            d[3] += counts[3]
+            d[4] += 1
+            total = 0 + counts[0] + counts[1] + counts[2] + counts[3]
+            for slot, k in ((5, model or "unknown"), (6, str(hour)), (7, project)):
+                d[slot][k] = d[slot].get(k, 0) + total
+    except Exception:                    # an odd model: add this file record by record
+        return None
+    return {k: v[:5] + [list(v[5].items()), list(v[6].items()), list(v[7].items())] for k, v in days.items()}
+
+
+def collect(window_days, projects=True, base=None, seen=None, cache=None):
     """Daily totals for one Claude Code folder. Pass one `seen` set to every folder in a run, in
-    claude_dirs() order: a message found in two folders then stays with the earlier one."""
+    claude_dirs() order: a message found in two folders then stays with the earlier one. With a
+    LogCache, files that haven't changed since the last run aren't read again, and a file none
+    of whose messages were seen before is added from its per-day sums; the result is identical
+    to reading every file (--no-cache)."""
+    if cache is not None and cache.projects != projects:
+        cache = None                     # records kept with(out) project names can't serve the other kind
+    if cache is not None:
+        before = set(seen) if seen is not None else None
+        try:
+            return _collect(window_days, projects, base, seen, cache)
+        except Exception as e:           # a cache we can't use is a full read, never a failed hook
+            note = f"tokenrpg: log cache not used ({type(e).__name__}); reading every file"
+            say(note) if QUIET else print(note, file=sys.stderr)      # stdout may be the JSON
+            cache.reset()
+            if seen is not None:
+                seen.clear()
+                seen.update(before)
+    return _collect(window_days, projects, base, seen, None)
+
+
+def _collect(window_days, projects, base, seen, cache):
     since = None
     if window_days:
         since = (datetime.now() - timedelta(days=window_days - 1)).date().isoformat()
@@ -92,44 +323,182 @@ def collect(window_days, projects=True, base=None, seen=None):
     days = defaultdict(new_day)
     base = base or default_dir()
     for path in glob.glob(os.path.join(glob.escape(base), "projects", "**", "*.jsonl"), recursive=True):
-        if since and os.path.getmtime(path) < cutoff:
+        st = os.stat(path)
+        if since and st.st_mtime < cutoff:
             continue
-        with open(path, errors="ignore") as fh:
-            for line in fh:
-                if '"usage"' not in line:
-                    continue
-                try:
-                    rec = json.loads(line)
-                except ValueError:
-                    continue
-                msg = rec.get("message") or {}
-                u, mid, ts = msg.get("usage"), msg.get("id"), rec.get("timestamp")
-                if not (isinstance(u, dict) and mid and ts) or mid in seen:
-                    continue
-                seen.add(mid)
-                try:
-                    local = datetime.fromisoformat(ts.replace("Z", "+00:00")).astimezone()
-                except ValueError:
-                    continue
-                key = local.date().isoformat()
-                if since and key < since:
-                    continue
-                d = days[key]
-                total = 0
-                for ours, theirs in FIELDS.items():
-                    v = u.get(theirs) or 0
-                    d[ours] += v
-                    total += v
-                d["messages"] += 1
-                d["models"][msg.get("model") or "unknown"] += total
-                d["hours"][str(local.hour)] += total
-                if projects:
-                    d["projects"][project_name(rec.get("cwd"))] += total
+        records = entry = None
+        if cache is not None:
+            entry = cache.get(path, st)
+            if entry is None:
+                records = read_log(path, projects)
+                entry = cache.put(path, st, records)
+            if entry["days"] is not None and seen.isdisjoint(entry["mids"]):
+                seen.update(entry["mids"])           # the fast way: every record counts
+                for key, (i, o, cw, cr, n, models, hours, projs) in entry["days"].items():
+                    if since and key < since:
+                        continue
+                    d = days[key]
+                    d["input"] += i
+                    d["output"] += o
+                    d["cache_write"] += cw
+                    d["cache_read"] += cr
+                    d["messages"] += n
+                    for k, total in models:
+                        d["models"][k] += total
+                    for k, total in hours:
+                        d["hours"][k] += total
+                    if projects:
+                        for k, total in projs:
+                            d["projects"][k] += total
+                continue
+            if records is None:
+                records = json.loads(entry["records"])
+        if records is None:
+            records = read_log(path, projects)
+        for mid, key, hour, counts, model, project in records:   # the record-by-record way
+            if mid in seen:
+                continue
+            seen.add(mid)
+            if key is None or (since and key < since):
+                continue
+            d = days[key]
+            total = 0
+            for ours, v in zip(FIELDS, counts):
+                d[ours] += v
+                total += v
+            d["messages"] += 1
+            d["models"][model or "unknown"] += total
+            d["hours"][str(hour)] += total
+            if projects:
+                d["projects"][project if isinstance(project, str) else project_name(project)] += total
     for d in days.values():
         d["models"].pop("<synthetic>", None)
         for k in ("models", "hours", "projects"):
             d[k] = dict(d[k])
     return dict(sorted(days.items()))
+
+
+_OWN_SHA = []
+
+
+def own_sha256():
+    """sha256 of this script's bytes as loaded, so any change to the code (not only a VERSION
+    bump) starts the cache afresh. Read once: a self-update replaces the file under us."""
+    if not _OWN_SHA:
+        try:
+            with open(HERE, "rb") as fh:
+                _OWN_SHA.append(hashlib.sha256(fh.read()).hexdigest())
+        except OSError:
+            _OWN_SHA.append(None)
+    return _OWN_SHA[0]
+
+
+def sweep_tmp(folder, older_than=600):
+    """Remove our own half-written files (<name>.<pid>.tmp) that a killed run left behind,
+    once they are older than any run could still be writing. Nothing else is touched."""
+    mine = tuple(os.path.basename(p) + "." for p in (CACHE, LAST_UPLOAD, UPLOAD_EVERY)) + (
+        os.path.basename(LAST_UPLOAD) + "-",)                   # the per-account stamps
+    try:
+        names = os.listdir(folder)
+    except OSError:
+        return
+    for name in names:
+        if not (name.startswith(mine) and name.endswith(".tmp")):
+            continue
+        middle = name[:-4].rsplit(".", 1)[-1]
+        path = os.path.join(folder, name)
+        try:
+            if middle.isdigit() and time.time() - os.lstat(path).st_mtime > older_than:
+                os.unlink(path)
+        except OSError:
+            pass
+
+
+class LogCache:
+    """Each log file's read_log() records and their per-day sums, keyed by its path and checked against its size,
+    modification and change times and inode: any difference and the file is read again. Kept
+    beside the config (log-cache.json, mode 600). Anything unexpected about the file (missing,
+    corrupt, cut short, written by another version, Python or time zone) means an empty cache,
+    so a full read, and it is replaced whole (written aside, then renamed), never edited."""
+
+    def __init__(self, path=None, projects=True):
+        self.path, self.projects = path or CACHE, projects
+        self.old, self.new = self._load(), {}
+
+    def stamp(self):
+        """What the records depend on besides the file: this collector's own code (its bytes,
+        not just VERSION), whether project names are kept, this Python's timestamp parsing, the
+        text encoding and the local time zone."""
+        try:
+            real = os.path.realpath("/etc/localtime")
+            st = os.stat(real)
+            zone = [real, st.st_size, st.st_mtime_ns]
+        except OSError:
+            zone = None
+        with open(os.devnull, errors="ignore") as fh:
+            encoding = fh.encoding           # what read_log's open() decodes with
+        return [VERSION, own_sha256(), self.projects, list(sys.version_info[:2]), encoding,
+                os.environ.get("TZ"), list(time.tzname), time.timezone, time.altzone, zone]
+
+    def _load(self):
+        try:
+            with open(self.path, "rb") as fh:
+                head, _, body = fh.read().partition(b"\n")
+            head = json.loads(head)
+            if head.get("stamp") != self.stamp() or head.get("sha256") != hashlib.sha256(body).hexdigest():
+                return {}
+            files = json.loads(body)
+            return files if isinstance(files, dict) else {}
+        except (OSError, ValueError, AttributeError):
+            return {}
+
+    @staticmethod
+    def key(st):
+        return [st.st_size, st.st_mtime_ns, st.st_ctime_ns, st.st_ino, st.st_dev]
+
+    def get(self, path, st):
+        """The file's entry if it is unchanged: {"st", "mids", "days" (summarise()), "records"
+        (read_log()'s, as JSON text, parsed only when a file has to be added record by record)}."""
+        entry = self.old.get(path)
+        if (isinstance(entry, dict) and entry.get("st") == self.key(st) and isinstance(entry.get("mids"), list)
+                and isinstance(entry.get("days"), (dict, type(None))) and isinstance(entry.get("records"), str)):
+            self.new[path] = entry
+            return entry
+        return None
+
+    def put(self, path, st, records):
+        entry = self.new[path] = {"st": self.key(st), "mids": [r[0] for r in records], "days": summarise(records),
+                                  "records": json.dumps(records, separators=(",", ":"))}
+        return entry
+
+    def reset(self):
+        self.old, self.new = {}, {}
+
+    def save(self):
+        """Write the cache if anything changed. Entries for files not looked at in this run (an
+        older day's file, another folder) are kept while the file exists."""
+        sweep_tmp(os.path.dirname(self.path))
+        files = dict(self.new)
+        for path, entry in self.old.items():
+            if path not in files and os.path.exists(path):
+                files[path] = entry
+        if files == self.old:
+            return
+        body = json.dumps(files, separators=(",", ":")).encode()
+        head = json.dumps({"stamp": self.stamp(), "sha256": hashlib.sha256(body).hexdigest()}).encode()
+        tmp = f"{self.path}.{os.getpid()}.tmp"
+        try:
+            os.makedirs(os.path.dirname(self.path), exist_ok=True)
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "wb") as fh:
+                fh.write(head + b"\n" + body)
+            os.replace(tmp, self.path)
+            self.old = files
+        except OSError:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
 
 
 # ---------- which Claude Code folders? one per account ----------
@@ -296,6 +665,7 @@ def _machine_key():
         except OSError:
             pass
     if sys.platform == "darwin":
+        import subprocess
         try:
             out = subprocess.run(["ioreg", "-rd1", "-c", "IOPlatformExpertDevice"],
                                  capture_output=True, text=True, timeout=10).stdout
@@ -332,6 +702,7 @@ def device(base=None):
                 fh.write(dev_id)
         if folder != default_dir():
             dev_id = hashlib.sha256(f"tokenrpg:{dev_id}:{folder}".encode()).hexdigest()[:32]
+    import platform
     host = (platform.node() or "this computer").split(".")[0]
     if folder == default_dir():
         label = host[:40]
@@ -377,6 +748,8 @@ def plan(base=None):
 # ---------- output: the terminal when run by hand, runs.log when run by the hook ----------
 
 QUIET = False
+LOG_UPLOADS = True                   # False for a throttled hook: its successes aren't logged
+LOG_LINES = 1000                     # runs.log keeps the newest this many lines
 
 
 def say(msg):
@@ -385,7 +758,7 @@ def say(msg):
             lines = []
             if os.path.exists(LOG):
                 with open(LOG) as fh:
-                    lines = fh.readlines()[-199:]
+                    lines = fh.readlines()[-(LOG_LINES - 1):]
             lines.append(f"{datetime.now():%Y-%m-%d %H:%M:%S} {msg}\n")
             with open(LOG, "w") as fh:
                 fh.writelines(lines)
@@ -403,6 +776,7 @@ def fail(msg):
 # ---------- HTTP: urllib, falling back to curl when Python can't verify certificates ----------
 
 def _is_cert_error(e):
+    import ssl
     reason = getattr(e, "reason", e)
     return isinstance(reason, ssl.SSLCertVerificationError) or "CERTIFICATE_VERIFY_FAILED" in str(reason)
 
@@ -410,6 +784,10 @@ def _is_cert_error(e):
 def http(url, data=None, headers=None):
     """Return (status, body_bytes). Python from python.org on macOS ships without a CA bundle
     until 'Install Certificates' is run; curl uses the system keychain, so fall back to it."""
+    import shutil
+    import subprocess
+    import urllib.error
+    import urllib.request
     headers = dict(headers or {}, **{"User-Agent": USER_AGENT})
     req = urllib.request.Request(url, data=data, headers=headers)
     try:
@@ -437,6 +815,7 @@ def http(url, data=None, headers=None):
 # ---------- self-update ----------
 
 def self_update(base_url, latest):
+    import urllib.error
     try:
         status, body = http(base_url + "/collector.py")
         if status != 200 or b"def main" not in body:
@@ -458,27 +837,58 @@ def _q(path):
     return "~/" + shlex.quote(path[2:]) if path.startswith("~/") else shlex.quote(path)
 
 
-def hook_command(every=None, py=None, script=None):
+def hook_command(event, py=None, script=None, no_projects=False):
     """Absolute interpreter + script paths: a hook started from the desktop app may not
     have the terminal's PATH. which('python3') is the stable symlink (it survives a
-    Homebrew minor upgrade); sys.executable is the fallback."""
+    Homebrew minor upgrade); sys.executable is the fallback. The command names its event and
+    carries no number: how often it uploads is the server's to say (v11)."""
+    import shutil
     py = py or shutil.which("python3") or sys.executable
-    flag = f" --at-most-every {every}" if every else ""
-    return f"{_q(py)} {_q(script or HERE)} --push --quiet{flag} >/dev/null 2>&1 || true"
+    return _command(event, _q(py), _q(script or HERE), no_projects)
 
 
-def hook_settings(py=None, script=None):
+def _command(event, py, script, no_projects=False, prefix=""):
+    flag = " --no-projects" if no_projects else ""
+    return f"{prefix}{py} {script} --hook {event}{flag} >/dev/null 2>&1 || true"
+
+
+def _entry(command):
+    return {"hooks": [{"type": "command", "async": True, "timeout": 60, "command": command}]}
+
+
+def hook_settings(py=None, script=None, no_projects=False):
     """The "hooks" block --install-hook merges in. The server shows the same block on the
     Settings page for people who edit settings.json by hand, so the two cannot disagree."""
-    return {event: [{"hooks": [{"type": "command", "async": True, "timeout": 60,
-                                "command": hook_command(every, py, script)}]}]
-            for event, every in HOOK_EVENTS.items()}
+    return {event: [_entry(hook_command(event, py, script, no_projects))] for event in HOOK_EVENTS}
+
+
+_WORD = r"""(?:'[^']*'|"[^"]*"|[^\s'"])+"""
+_OUR_COMMAND = re.compile(r"\s*((?:[A-Za-z_][A-Za-z0-9_]*=(?:" + _WORD + r")?\s+)*)(" + _WORD + r")\s+"
+                          r"""(?:'[^']*tally_tokens\.py'|"[^"]*tally_tokens\.py"|[^\s'"]*tally_tokens\.py)(?=\s|$)""")
+
+
+def kept_from(command):
+    """(prefix, interpreter) a player chose in one of our old hook commands, kept by a rerun of
+    step 3: leading VAR=value settings (e.g. TOKENRPG_CONFIG=...) and an interpreter given as a
+    path. A bare "python3" is not kept: hooks get an absolute one, as the desktop app may not
+    have the terminal's PATH. ("", None) when there is nothing to keep."""
+    m = _OUR_COMMAND.match(command or "")
+    if not m:
+        return "", None
+    py = m.group(2)
+    return m.group(1), (py if py.strip("'\"").startswith(("/", "~/")) else None)
+
+
+def _ours(hook):
+    """One of our hook commands, in any form a collector has written (matching "tokenrpg"
+    failed when the path was capitalised)."""
+    return isinstance(hook, dict) and "tally_tokens.py" in str(hook.get("command", ""))
 
 
 def installed_hooks(base):
     """Which of our events this folder's settings.json has a hook for. Only these event
-    names are sent, so the site can say whether a machine updates every 10 minutes; nothing
-    else in settings.json (which can hold env vars and keys) is read into the upload."""
+    names are sent, so the site can say whether a machine also updates during long replies;
+    nothing else in settings.json (which can hold env vars and keys) is read into the upload."""
     try:
         with open(os.path.join(base, "settings.json")) as fh:
             hooks = json.load(fh).get("hooks") or {}
@@ -499,19 +909,20 @@ def hooks_that_upload(base):
     return [] if on_windows_drive(primary) else installed_hooks(primary)
 
 
-def install_hook(dirs=None):
-    """Add SessionStart + SessionEnd upload hooks to the settings.json of every counted Claude
-    Code folder, so a session in any account uploads them all. Run by hand with no folders
-    given, it first offers any account folder not counted yet.
+def install_hook(dirs=None, no_projects=False):
+    """Add the HOOK_EVENTS upload hooks to the settings.json of every counted Claude Code
+    folder, so a session in any account uploads them all. Run by hand with no folders given,
+    it first offers any account folder not counted yet.
 
-    Keeps every existing setting and hook, backs each file up first, skips a folder whose
-    hook is already there, and refuses to touch a file that is not valid JSON."""
+    Keeps every existing setting and every hook that isn't ours, replaces our older hooks
+    rather than adding a second set, backs each file up first, leaves a folder that is already
+    set up alone, and refuses to touch a file that is not valid JSON."""
     if dirs is None:
         offer_new_dirs()
         dirs = claude_dirs(for_hooks=True) or [default_dir()]
     added, problems = False, []
     for base in dirs:
-        result = _install_hook_in(base)
+        result = _install_hook_in(base, no_projects)
         if result is None:
             added = True
         elif result:
@@ -542,8 +953,10 @@ def on_windows_drive(path):
     return len(drive) == 1 and "a" <= drive.lower() <= "z" and is_wsl()
 
 
-def _install_hook_in(base):
-    """None when hooks were added, "" when already there or skipped, else what went wrong."""
+def _install_hook_in(base, no_projects=False):
+    """None when hooks were added or replaced, "" when already there or skipped, else what
+    went wrong. Our old entries (any earlier collector's) are replaced, never duplicated, and
+    every hook that isn't ours stays exactly as it was."""
     where = short(base)
     # The folder, or a settings.json symlinked from it, on a Windows drive.
     if on_windows_drive(base) or on_windows_drive(os.path.join(base, "settings.json")):
@@ -552,26 +965,59 @@ def _install_hook_in(base):
         return ""
     # A symlinked settings.json (dotfiles, or shared by two accounts) stays a symlink.
     path = os.path.realpath(os.path.join(base, "settings.json"))
-    settings = {}
+    settings, original = {}, {}
     if os.path.exists(path):
         try:
             with open(path) as fh:
-                settings = json.load(fh)
+                text = fh.read()
+            settings, original = json.loads(text), json.loads(text)
         except ValueError as e:
             return (f"tokenrpg: {path} is not valid JSON ({e}); left it untouched. "
                     "Fix it, then run --install-hook again.")
         if not isinstance(settings, dict):
             return f"tokenrpg: {path} is not a JSON object; left it untouched."
     hooks = settings.setdefault("hooks", {})
-    added = []
-    for event, entries in hook_settings().items():
-        existing = hooks.setdefault(event, [])
-        if "tally_tokens.py" in json.dumps(existing):  # present in every form we have written
-            continue
-        existing.extend(entries)
-        added.append(event)
-    if not added:
-        say(f"✓ {where}: already set up. Claude Code uploads when a session starts or ends, and every ~10 minutes in between.")
+    if not isinstance(hooks, dict) or any(not isinstance(hooks.get(e, []), list) for e in HOOK_EVENTS):
+        return f"tokenrpg: the \"hooks\" in {path} are not in the shape Claude Code uses; left it untouched."
+    # Someone who added --no-projects to our hooks by hand keeps it: a rerun never sends more.
+    no_projects = no_projects or any(_ours(h) and "--no-projects" in str(h.get("command"))
+                                     for e in HOOK_EVENTS for entry in hooks.get(e, [])
+                                     if isinstance(entry, dict) and isinstance(entry.get("hooks"), list)
+                                     for h in entry["hooks"])
+    olds = {e: [str(h.get("command")) for entry in hooks.get(e, []) if isinstance(entry, dict)
+                and isinstance(entry.get("hooks"), list) for h in entry["hooks"] if _ours(h)] for e in HOOK_EVENTS}
+    every = [c for e in HOOK_EVENTS for c in olds[e]]       # a new event copies a customised one, if any
+    anyold = next((c for c in every if kept_from(c) != ("", None)), every[0] if every else "")
+    added, replaced, changed = [], [], []
+    for event in HOOK_EVENTS:
+        old = (olds[event] or [anyold])[0]
+        prefix, py = kept_from(old)
+        command = (_command(event, py, _q(HERE), no_projects, prefix) if py
+                   else prefix + hook_command(event, no_projects=no_projects))
+        ours = _entry(command)
+        if olds[event] and olds[event] != [command]:
+            changed.append((event, olds[event], command))
+        entries, placed, had = [], False, False
+        for entry in hooks.get(event, []):
+            inner = entry.get("hooks") if isinstance(entry, dict) else None
+            if not isinstance(inner, list) or not any(_ours(h) for h in inner):
+                entries.append(entry)            # not ours: untouched, in its place
+                continue
+            had = True
+            theirs = [h for h in inner if not _ours(h)]
+            if theirs:                           # ours was merged into someone's entry by hand
+                entries.append(dict(entry, hooks=theirs))
+            if not placed:                       # ours goes where the old one was
+                entries.append(ours)
+                placed = True
+        if not placed:
+            entries.append(ours)
+        if entries != hooks.get(event):
+            (replaced if had else added).append(event)
+        hooks[event] = entries
+    if settings == original:
+        say(f"✓ {where}: already set up. Claude Code uploads when a session starts or ends, and every "
+            f"~{upload_every() // 60} minutes while you work, also during long replies.")
         return ""
     os.makedirs(os.path.dirname(path), exist_ok=True)
     if os.path.exists(path):
@@ -584,8 +1030,11 @@ def _install_hook_in(base):
         json.dump(settings, fh, indent=2)
         fh.write("\n")
     os.replace(tmp, path)
-    say(f"✓ {where}: Claude Code will now upload when a session starts or ends, and every ~10 minutes "
-        f"while you work (added: {', '.join(added)}).")
+    for event, old, new in changed:
+        say(f"  {event}: " + " and ".join(old) + f"\n    is now: {new}")
+    what = "; ".join(f"{k}: {', '.join(v)}" for k, v in (("added", added), ("updated", replaced)) if v)
+    say(f"✓ {where}: Claude Code will now upload when a session starts or ends, and every ~{upload_every() // 60} "
+        f"minutes while you work, also during long replies ({what}).")
     return None
 
 
@@ -605,46 +1054,49 @@ def add_dir(path, projects=True):
              "counting it would count those days twice. Nothing changed.")
     _remember(path, True)
     say(f"✓ Counting {short(path)}.")
-    install_hook([path])
+    install_hook([path], no_projects=not projects)
+    lock = upload_lock() if os.path.exists(CONFIG) else None
+    try:
+        _add_dir_upload(path, projects)
+    finally:
+        if lock:
+            lock.close()
+
+
+def _add_dir_upload(path, projects):
     if os.path.exists(CONFIG):
-        seen, days = set(), {}
+        seen, days, cache = set(), {}, LogCache(projects=projects)
         for d in claude_dirs():          # earlier folders first, so they keep their messages
-            got = collect(0, projects=projects, base=d, seen=seen)
+            got = collect(0, projects=projects, base=d, seen=seen, cache=cache)
             if _ident(d) == _ident(path):
                 days = got
+        cache.save()
         if days:
             push([(path, days)])
 
 
 # ---------- upload ----------
 
-def uploaded_within(seconds):
-    """True if an upload started less than `seconds` ago. A stamp up to a minute ahead is
-    jitter and counts as recent; further ahead (the clock was moved back) counts as long ago,
-    so a wrong clock never stops uploads."""
+def keep_rate(every):
+    """Store the server's upload rate for the throttled hooks (clamped; ignored unless a whole
+    number of seconds). Written only when it changes."""
+    if not isinstance(every, int) or isinstance(every, bool):
+        return
+    every = min(MAX_EVERY, max(MIN_EVERY, every))
+    if every == upload_every() and os.path.exists(UPLOAD_EVERY):
+        return
     try:
-        with open(LAST_UPLOAD) as fh:
-            age = time.time() - float(fh.read().strip())
-    except (OSError, ValueError):
-        return False
-    return -60 <= age < seconds
-
-
-def mark_upload():
-    """Record that an upload is starting. Every upload marks it, so the throttled hook also
-    skips right after a session's start or end upload."""
-    try:
-        os.makedirs(os.path.dirname(LAST_UPLOAD), exist_ok=True)
-        tmp = LAST_UPLOAD + ".tmp"
+        tmp = f"{UPLOAD_EVERY}.{os.getpid()}.tmp"
         with open(tmp, "w") as fh:
-            fh.write(f"{time.time():.3f}\n")   # not rounded: a rounded-up stamp reads as the future
-        os.replace(tmp, LAST_UPLOAD)
+            fh.write(f"{every}\n")
+        os.replace(tmp, UPLOAD_EVERY)
     except OSError:
         pass
 
 
 def push(uploads):
     """uploads: [(folder, days)]. One request per folder: each is its own machine row."""
+    import urllib.error
     try:
         with open(CONFIG) as fh:
             cfg = json.load(fh)
@@ -674,11 +1126,13 @@ def push(uploads):
         skipped = result.get("skipped") or {}
         if skipped:
             say(f"tokenrpg: {len(skipped)} day(s) refused by the server: {skipped}")
+        keep_rate(result.get("upload_every"))
         handle, n = result.get("handle"), result.get("accepted", 0)
         span = f" ({min(days)} to {max(days)})" if days else ""
         where = f" from {result['device']}" if result.get("device") else ""
         badge = f", {result['plan']}" if result.get("plan") else ""
-        say(f"✓ Uploaded {n} day{'s' if n != 1 else ''} of Claude Code usage{span}{where}{badge}.")
+        if LOG_UPLOADS:                  # not every 2 minutes' success: runs.log must cover days
+            say(f"✓ Uploaded {n} day{'s' if n != 1 else ''} of Claude Code usage{span}{where}{badge}.")
         latest = max(latest, result.get("collector_version") or 0)
     if not QUIET:
         say(f"  Your hero: {base}/u/{handle}")
@@ -687,7 +1141,7 @@ def push(uploads):
 
 
 def main():
-    global QUIET
+    global QUIET, LOG_UPLOADS
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--days", type=int, default=28, help="window in days, 0 = everything (default 28)")
     ap.add_argument("--push", action="store_true", help="upload instead of printing")
@@ -697,25 +1151,60 @@ def main():
                     help="add upload hooks to each Claude Code folder's settings.json (safe to re-run)")
     ap.add_argument("--add-dir", metavar="DIR",
                     help="also count another Claude account's folder and upload its history (safe to re-run)")
+    ap.add_argument("--hook", metavar="EVENT",
+                    help="how Claude Code runs it (--push --quiet, throttled to the server's rate for "
+                         "the events that fire often); --install-hook writes these")
     ap.add_argument("--at-most-every", type=int, metavar="SECONDS",
-                    help="skip this upload if one started in the last SECONDS (the after-each-reply hook uses 600)")
+                    help="from older hooks: now means throttled to the server's rate, whatever SECONDS says")
+    ap.add_argument("--no-cache", action="store_true",
+                    help=f"read every log file again, without {CACHE}")
     ap.add_argument("--version", action="version", version=f"tokenrpg collector v{VERSION}")
     args = ap.parse_args()
+    if args.hook:
+        args.push = args.quiet = True
     QUIET = args.quiet
     if args.add_dir:
         add_dir(args.add_dir, projects=not args.no_projects)
         return
     if args.install_hook:
-        install_hook()
+        install_hook(no_projects=args.no_projects)
         return
-    if args.push:
-        if args.at_most_every and uploaded_within(args.at_most_every):
-            return                       # quietly: this runs after every reply
-        mark_upload()
+    throttled = hook_call(sys.argv[1:])[1]                        # the same rule as the fast path
+    if args.push and not CLAIMED:        # run as a script, the fast path at the top has claimed it
+        if not claim_upload(throttled):
+            return                       # quietly: this runs after every reply and tool call
     if args.push and not QUIET:
         offer_new_dirs()                 # a person is at the terminal; the hook never asks
+    LOG_UPLOADS = not (QUIET and throttled)   # runs.log keeps start/end uploads and every problem
+    lock = upload_lock() if args.push else None
+    try:
+        collect_and_send(args)
+    finally:
+        if lock:
+            lock.close()
+
+
+def upload_lock():
+    """UPLOAD_LOCK, held from reading the logs until the server has replied, so an upload that
+    started later (SessionEnd, after a slow mid-reply one) reads the logs only after the earlier
+    one has landed, and the server's last copy is always the newest. None if it can't be had."""
+    if not fcntl:
+        return None
+    try:
+        os.makedirs(os.path.dirname(UPLOAD_LOCK), exist_ok=True)
+        lock = open(UPLOAD_LOCK, "a")
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        return lock
+    except OSError:
+        return None
+
+
+def collect_and_send(args):
     dirs, seen = claude_dirs(), set()
-    per = [(d, collect(args.days, projects=not args.no_projects, base=d, seen=seen)) for d in dirs]
+    cache = None if args.no_cache else LogCache(projects=not args.no_projects)
+    per = [(d, collect(args.days, projects=not args.no_projects, base=d, seen=seen, cache=cache)) for d in dirs]
+    if cache is not None and args.push:
+        cache.save()                     # an upload keeps it; printing only reads it (no state from a look)
     if not args.push:
         out = per[0][1] if len(per) == 1 else {short(d): days for d, days in per}
         json.dump(out, sys.stdout, indent=1)
