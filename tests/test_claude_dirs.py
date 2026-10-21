@@ -761,6 +761,7 @@ class LogCacheTests(Home):
         self.reads.clear()
         cached = self.printed("--days", "0", *argv)
         n = len(self.reads)
+        self.cached_reads = list(self.reads)          # the --no-cache run below reads every file too
         self.assertEqual(cached, self.printed("--days", "0", "--no-cache", *argv))
         return n
 
@@ -815,7 +816,7 @@ class LogCacheTests(Home):
         self.same()
         path = self.write("b", [usage_line("m5", cache_read_input_tokens=7)], mode="a", sub="other")
         self.assertEqual(self.same(), 1)
-        self.assertEqual(self.reads[-1], path) if self.reads else None
+        self.assertEqual(self.cached_reads, [path])
         self.assertIn("m5", json.dumps(self.read_cache()))
 
     def test_same_size_same_mtime_rewrite_is_still_seen(self):
