@@ -19,6 +19,7 @@ import sys
 import tempfile
 import time
 import unittest
+from datetime import date, timedelta
 from unittest import mock
 
 _spec = importlib.util.spec_from_file_location(
@@ -564,11 +565,6 @@ class OddPaths(Home):
         self.assertEqual(tt.discover(), [work])
         self.assertEqual(sum(d["cache_read"] for d in tt.collect(0).values()), 1000)
 
-    def test_windows_paths_give_only_the_folder_name(self):
-        self.assertEqual(tt.project_name(r"C:\Users\Pat\Clients\Acme Ltd\app"), "Acme Ltd/app")
-        self.assertEqual(tt.project_name(r"C:\Users\Pat\Clients\Acme"), "Acme")
-        self.assertEqual(tt.project_name("/home/pat/code/garden/app"), "garden/app")
-
 
 # ---------- collector v11: the server sets the rate, and only changed files are read ----------
 
@@ -780,36 +776,25 @@ class LogCacheTests(Home):
         self.assertEqual(self.same(), 3)                    # first run: every file
         self.assertEqual(self.same(), 0)                    # nothing changed: none
         self.assertEqual(self.same("--days", "28"), 0)
-        self.assertEqual(self.same("--no-projects"), 3)              # kept apart: no names in it
-        self.assertEqual(self.same("--no-projects"), 0)
+        self.assertEqual(self.same("--no-projects"), 0)              # a no-op since v12: the same cache serves it
 
-    def test_the_cache_keeps_project_names_never_paths_and_none_under_no_projects(self):
+    def test_the_cache_keeps_no_project_names_and_no_paths(self):
+        # v11 kept each record's project name; v12 never reads the working folder. (The cache's keys are the
+        # log files' own paths, on the player's disk only.)
         self.corpus()
         self.same()
-        text = json.dumps(self.read_cache())
-        self.assertNotIn("/w/", text)                                 # no working directory
-        for name in ('"alpha"', '"beta/app"', '"gamma"'):
-            self.assertIn(name, text)
-        self.same("--no-projects")
-        text = json.dumps(self.read_cache())
-        for leak in ("/w/", "alpha", "beta", "gamma"):
-            self.assertNotIn(leak, text)
+        for entry in self.read_cache().values():
+            text = json.dumps([entry["records"], entry["days"]])
+            for leak in ("/w/", "alpha", "beta", "gamma", "delta"):
+                self.assertNotIn(leak, text)
+            self.assertTrue(all(len(r) == 5 for r in json.loads(entry["records"])))     # no project slot
 
-    def test_a_cache_of_the_other_kind_is_not_used(self):
-        self.corpus()
-        full = tt.collect(0, projects=True, base=self.base)
-        nameless = tt.LogCache(projects=False)
-        tt.collect(0, projects=False, base=self.base, cache=nameless)
-        nameless.save()
-        self.assertEqual(tt.collect(0, projects=True, base=self.base, cache=nameless), full)
-
-    def test_a_cwd_project_name_cannot_read_fails_only_when_counted(self):
-        # A full read only names the projects of counted records, so an odd cwd on a duplicate
-        # must not break a cached run either.
-        self.write("a", [usage_line("m1"), json.dumps({"timestamp": "not a time", "cwd": ["odd"],     # never counted
+    def test_an_odd_cwd_is_never_looked_at(self):
+        # v11 failed on a cwd it couldn't name (a list here) if that record counted; v12 never reads cwd.
+        self.write("a", [usage_line("m1"), json.dumps({"timestamp": "2026-10-01T13:00:00Z", "cwd": ["odd"],
                          "message": {"id": "m2", "usage": {"input_tokens": 1}}})])
         self.assertEqual(self.same(), 1)
-        self.assertEqual(self.same("--no-projects"), 1)
+        self.assertIn('"input": 1', self.printed("--days", "0"))
 
     def test_a_changed_file_is_read_again_and_only_it(self):
         self.corpus()
@@ -948,6 +933,144 @@ class LogCacheTests(Home):
         with mock.patch.object(tt, "summarise", return_value=None):          # force record by record
             os.unlink(tt.CACHE)
             self.assertEqual(self.printed("--days", "0"), cached)
+
+
+# ---------- collector v12: no project names, and the kind of computer (22oct2026.md round 1a) ----------
+
+# Folder names planted where a project name could come from: the working folder (cwd, Linux and Windows
+# spellings, under a generic last part that v11 sent as "parent/app") and the folder Claude Code files the
+# session under (projects/<encoded cwd>/).
+PLANTED = ("QQPLANTEDQQ", "QQWINPLANTQQ", "QQDIRPLANTQQ")
+OS_VALUES = {"mac", "linux", "wsl", "windows"}
+# Exactly what an upload may hold (allow-listed, so a new key anywhere is a failure, not a pass).
+PAYLOAD_KEYS = {"days", "device", "plan", "hooks", "client", "os"}
+DAY_KEYS = {"input", "output", "cache_write", "cache_read", "messages", "models", "hours"}
+PLAN_KEYS = set(tt.PLAN_FIELDS) | {"subscriptionType", "rateLimitTier"}
+
+
+class NoProjectNames(Home):
+    # Days inside the hooks' 28-day window whenever the suite runs; noon UTC is one local day anywhere.
+    DAY1, DAY2 = (date.today() - timedelta(days=3)).isoformat(), (date.today() - timedelta(days=2)).isoformat()
+
+    def setUp(self):
+        super().setUp()
+        self.folder(".claude", MAX5)
+        self.write(os.path.join(self.home, ".claude"), "-home-zz-QQDIRPLANTQQ", "s1", [
+            usage_line("p1", f"{self.DAY1}T12:00:00Z", cwd="/home/zz/QQPLANTEDQQ/app"),
+            usage_line("p2", f"{self.DAY2}T12:00:00Z", cwd="C:\\Users\\zz\\QQWINPLANTQQ\\src", model="claude-opus-4-1"),
+            usage_line("p3", f"{self.DAY2}T13:00:00Z", cwd="/home/zz/QQPLANTEDQQ", input_tokens=1.5)])   # no fast path
+
+    def write(self, base, sub, session, lines):
+        path = os.path.join(base, "projects", sub, f"{session}.jsonl")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "a") as fh:
+            fh.write("".join(line + "\n" for line in lines))
+
+    def assert_clean(self, bodies):
+        self.assertTrue(bodies)
+        for body in bodies:
+            text = json.dumps(body)
+            for leak in PLANTED:
+                self.assertNotIn(leak, text)
+            self.assertEqual(set(body), PAYLOAD_KEYS)
+            self.assertEqual(set(body["device"]), {"id", "label"})
+            self.assertLessEqual(set(body["plan"]), PLAN_KEYS)
+            self.assertLessEqual(set(body["hooks"]), set(tt.HOOK_EVENTS))
+            self.assertEqual(body["client"], f"tally_tokens/{tt.VERSION}")
+            self.assertIn(body["os"], OS_VALUES)
+            for day, rec in body["days"].items():
+                self.assertRegex(day, r"^\d{4}-\d{2}-\d{2}$")
+                self.assertEqual(set(rec), DAY_KEYS, day)
+                self.assertLessEqual(set(rec["hours"]), {str(h) for h in range(24)})
+                self.assertTrue(all(isinstance(v, (int, float)) for v in rec["models"].values()))
+
+    def test_no_upload_holds_a_folder_name_or_path(self):
+        work = self.folder(".claude-work", {}, session="w")
+        self.write(work, "-home-zz-QQDIRPLANTQQ", "w1", [usage_line("w1", f"{self.DAY1}T12:00:00Z", cwd="/srv/QQPLANTEDQQ/src")])
+        bodies = self.run_cli("--push", "--days", "0", tty=True, answers=["y"])    # by hand, counting both
+        self.assertEqual(len(bodies), 2)
+        bodies += self.run_cli("--hook", "SessionStart")
+        bodies += self.run_cli("--push", "--days", "0", "--no-cache")
+        other = os.path.realpath(tempfile.mkdtemp(prefix="extra"))
+        self.write(other, "-home-zz-QQDIRPLANTQQ", "x1", [usage_line("x1", f"{self.DAY1}T12:00:00Z",
+                                                                     cwd="/home/zz/QQPLANTEDQQ/web")])
+        bodies += self.run_cli("--add-dir", other)
+        self.assert_clean(bodies)
+        self.assertEqual(sum(len(b["days"]) for b in bodies), (2 + 1) * 3 + 1)   # every run sent its days
+        self.run_cli("--days", "0")                       # and what printing shows
+        for leak in PLANTED:
+            self.assertNotIn(leak, self.out)
+
+    def test_the_cache_holds_no_project_name(self):
+        self.run_cli("--push", "--days", "0")
+        with open(tt.CACHE, "rb") as fh:
+            files = json.loads(fh.read().partition(b"\n")[2])
+        self.assertTrue(files)
+        for entry in files.values():                     # its keys are the log files' own local paths
+            for leak in PLANTED:
+                self.assertNotIn(leak, json.dumps([entry["records"], entry["days"], entry["mids"]]))
+
+    def test_no_projects_is_a_no_op(self):
+        plain = self.run_cli("--push", "--days", "0")
+        flagged = self.run_cli("--push", "--days", "0", "--no-projects")
+        self.assertEqual(flagged, plain)
+        self.run_cli("--days", "0")
+        printed = self.out
+        self.run_cli("--days", "0", "--no-projects")
+        self.assertEqual(self.out, printed)
+        hooked = self.run_cli("--hook", "SessionEnd", "--no-projects")         # an old hook command still runs
+        self.assertEqual(hooked, self.run_cli("--hook", "SessionEnd"))
+        self.assertEqual(self.run_cli("--push", "--quiet", "--no-projects"), hooked)   # v6-v10's form too
+        self.assert_clean(plain + hooked)
+
+    def test_a_v11_cache_is_never_read(self):
+        """A cache written by v11 (header stamp [11, its sha, the projects flag, ...], records with a project
+        name) is a full read: its names never reach an upload. Built here in v11's exact layout."""
+        self.run_cli("--push", "--days", "0")
+        with open(tt.CACHE, "rb") as fh:
+            files = json.loads(fh.read().partition(b"\n")[2])
+        for entry in files.values():
+            records = [r + ["QQV11PROJQQ"] for r in json.loads(entry["records"])]
+            entry["records"] = json.dumps(records, separators=(",", ":"))
+            if entry["days"] is not None:
+                entry["days"] = {k: v + [[["QQV11PROJQQ", 1]]] for k, v in entry["days"].items()}
+        body = json.dumps(files, separators=(",", ":")).encode()
+        v12 = tt.LogCache().stamp()
+        v11 = [11, "0" * 64, True] + v12[2:]
+        head = json.dumps({"stamp": v11, "sha256": hashlib.sha256(body).hexdigest()}).encode()
+        with open(tt.CACHE, "wb") as fh:
+            fh.write(head + b"\n" + body)
+        self.assertEqual(tt.LogCache().old, {})                                   # refused at the header
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            sent = self.run_cli("--push", "--days", "0")
+        self.assertNotIn("QQV11PROJQQ", json.dumps(sent))
+        self.assertEqual(err.getvalue(), "")                                      # not a crash and a fallback
+        self.assertEqual(sent, self.run_cli("--push", "--days", "0", "--no-cache"))
+        self.assertGreater(tt.VERSION, 11)
+
+
+class MachineOs(unittest.TestCase):
+    """collector v12 sends the kind of computer, one word of four, nothing else about it."""
+
+    def kind(self, platform, version="Linux version 6.9.7-arch1-1 (linux@archlinux)"):
+        d = tempfile.mkdtemp()
+        path = os.path.join(d, "version")
+        with open(path, "w") as fh:
+            fh.write(version)
+        with mock.patch.object(tt.sys, "platform", platform):
+            return tt.machine_os(path)
+
+    def test_four_kinds(self):
+        wsl = "Linux version 5.15.153.1-microsoft-standard-WSL2 (root@1c602f52c2e4)"
+        self.assertEqual(self.kind("darwin"), "mac")
+        self.assertEqual(self.kind("darwin", wsl), "mac")
+        self.assertEqual(self.kind("linux"), "linux")
+        self.assertEqual(self.kind("linux", wsl), "wsl")
+        self.assertEqual(self.kind("linux", "Linux version 4.4.0-19041-Microsoft (Microsoft@Microsoft.com)"), "wsl")
+        for windows in ("win32", "cygwin", "msys"):
+            self.assertEqual(self.kind(windows), "windows", windows)
+        self.assertEqual(self.kind("freebsd14"), "linux")              # any other Unix: the nearest of the four
+        self.assertIn(tt.machine_os(), OS_VALUES)                       # this computer, unpatched
 
 
 if __name__ == "__main__":

@@ -3,15 +3,15 @@
 
 Reads ~/.claude/projects/**/*.jsonl, plus any other Claude account's folder the player chose
 (one per account, e.g. ~/.claude-work used through CLAUDE_CONFIG_DIR). Each folder uploads as
-its own machine row. Runs on Linux, macOS and WSL with any Python 3.9+. Only numbers, project folder names
-and a machine label leave this script (the label is the computer's name, plus the account folder's
-name, e.g. "claude-work", seen only by the player and the site admin): never prompts, code, file paths or
-message content. Standard library only, so a friend can drop the single file anywhere.
+its own machine row. Runs on Linux, macOS and WSL with any Python 3.9+. Only numbers, a machine label
+and the kind of computer leave this script (the label is the computer's name, plus the account folder's
+name, e.g. "claude-work"; the kind is mac, linux, wsl or windows; both are seen only by the player and the
+site admin): never prompts, code, file paths, the names of the folders you work in, or message content.
+Standard library only, so a friend can drop the single file anywhere.
 
   tally_tokens.py                 print the last 28 days as JSON (keyed by folder if there are several)
   tally_tokens.py --days 0        print everything still on disk
   tally_tokens.py --push          upload to the server in ~/.config/tokenrpg/config.json
-  tally_tokens.py --no-projects   leave project names out
   tally_tokens.py --install-hook  make Claude Code upload automatically (edits each folder's settings.json)
   tally_tokens.py --add-dir DIR   also count a Claude Code folder kept somewhere unusual
                                   (one on a Windows drive, /mnt/..., is read but never given hooks)
@@ -32,7 +32,7 @@ try:
 except ImportError:                  # not on native Windows, which isn't supported anyway
     fcntl = None
 
-VERSION = 11  # bump on every change; the server tells older copies to update themselves
+VERSION = 12  # bump on every change; the server tells older copies to update themselves
 USER_AGENT = f"tokenrpg-collector/{VERSION} (+https://tokenrpg.tinfoilhatsociety.cc)"
 HERE = os.path.abspath(__file__)
 LOG = os.path.join(os.path.dirname(HERE), "runs.log")
@@ -204,35 +204,17 @@ FIELDS = {
 }
 
 
-GENERIC = {"app", "src", "web", "webapp", "site", "frontend", "backend", "server", "client",
-           "api", "code", "repo", "project", "dashboard", "admin", "scripts", "tools"}
-
-
-def project_name(cwd):
-    """Last folder name; 'parent/app' when the last one says nothing on its own. Splits on both
-    slashes: transcripts from Windows Claude Code (read through WSL) hold C:\\Users\\... paths."""
-    parts = [p for p in (cwd or "").replace("\\", "/").split("/") if p]
-    if not parts:
-        return "~"
-    if parts[-1].lower() in GENERIC and len(parts) > 1:
-        return f"{parts[-2]}/{parts[-1]}"
-    return parts[-1]
-
-
 def new_day():
     return {"input": 0, "output": 0, "cache_write": 0, "cache_read": 0, "messages": 0,
-            "models": defaultdict(int), "hours": defaultdict(int), "projects": defaultdict(int)}
+            "models": defaultdict(int), "hours": defaultdict(int)}
 
 
-BAD_CWD = [0]    # stands for a cwd project_name() fails on: it fails on this too, at the same record
-
-
-def read_log(path, projects=True):
+def read_log(path):
     """One log file's usage records, in file order: [message id, local day, local hour, the four
-    FIELDS counts, model, project]. Streaming writes a message more than once; only its first
-    complete line is kept, the one a single pass over every file would count. A timestamp that
-    doesn't parse leaves day and hour None: its id still counts as seen. The project is
-    project_name(cwd), never the path itself, and None under --no-projects."""
+    FIELDS counts, model]. Streaming writes a message more than once; only its first complete
+    line is kept, the one a single pass over every file would count. A timestamp that doesn't
+    parse leaves day and hour None: its id still counts as seen. The working folder (cwd) is never
+    used (v12: project names are no longer collected)."""
     out, mine = [], set()
     with open(path, errors="ignore") as fh:
         for line in fh:
@@ -252,58 +234,49 @@ def read_log(path, projects=True):
                 day, hour = local.date().isoformat(), local.hour
             except ValueError:
                 day = hour = None
-            project = None
-            if projects:
-                try:
-                    project = project_name(rec.get("cwd"))
-                except (AttributeError, TypeError):
-                    project = BAD_CWD    # a full read fails only if this record is counted
-            out.append([mid, day, hour, [u.get(theirs) or 0 for theirs in FIELDS.values()],
-                        msg.get("model"), project])
+            out.append([mid, day, hour, [u.get(theirs) or 0 for theirs in FIELDS.values()], msg.get("model")])
     return out
 
 
 def summarise(records):
     """One file's records added up per day, exactly as _collect adds them when none of them is
-    skipped: {day: [input, output, cache_write, cache_read, messages, models, hours, projects]},
-    the last three as [key, tokens] pairs in first-seen order (the order the upload's keys come
+    skipped: {day: [input, output, cache_write, cache_read, messages, models, hours]},
+    the last two as [key, tokens] pairs in first-seen order (the order the upload's keys come
     out in). None when a count isn't a plain int, since floats added in another order could
     round differently; such a file is always added record by record."""
     days = {}
     try:
-        for mid, key, hour, counts, model, project in records:
+        for mid, key, hour, counts, model in records:
             if key is None:
                 continue
-            if any(type(v) is not int for v in counts) or not isinstance(project, (str, type(None))):
+            if any(type(v) is not int for v in counts):
                 return None
             d = days.get(key)
             if d is None:
-                d = days[key] = [0, 0, 0, 0, 0, {}, {}, {}]
+                d = days[key] = [0, 0, 0, 0, 0, {}, {}]
             d[0] += counts[0]
             d[1] += counts[1]
             d[2] += counts[2]
             d[3] += counts[3]
             d[4] += 1
             total = 0 + counts[0] + counts[1] + counts[2] + counts[3]
-            for slot, k in ((5, model or "unknown"), (6, str(hour)), (7, project)):
+            for slot, k in ((5, model or "unknown"), (6, str(hour))):
                 d[slot][k] = d[slot].get(k, 0) + total
     except Exception:                    # an odd model: add this file record by record
         return None
-    return {k: v[:5] + [list(v[5].items()), list(v[6].items()), list(v[7].items())] for k, v in days.items()}
+    return {k: v[:5] + [list(v[5].items()), list(v[6].items())] for k, v in days.items()}
 
 
-def collect(window_days, projects=True, base=None, seen=None, cache=None):
+def collect(window_days, base=None, seen=None, cache=None):
     """Daily totals for one Claude Code folder. Pass one `seen` set to every folder in a run, in
     claude_dirs() order: a message found in two folders then stays with the earlier one. With a
     LogCache, files that haven't changed since the last run aren't read again, and a file none
     of whose messages were seen before is added from its per-day sums; the result is identical
     to reading every file (--no-cache)."""
-    if cache is not None and cache.projects != projects:
-        cache = None                     # records kept with(out) project names can't serve the other kind
     if cache is not None:
         before = set(seen) if seen is not None else None
         try:
-            return _collect(window_days, projects, base, seen, cache)
+            return _collect(window_days, base, seen, cache)
         except Exception as e:           # a cache we can't use is a full read, never a failed hook
             note = f"tokenrpg: log cache not used ({type(e).__name__}); reading every file"
             say(note) if QUIET else print(note, file=sys.stderr)      # stdout may be the JSON
@@ -311,10 +284,10 @@ def collect(window_days, projects=True, base=None, seen=None, cache=None):
             if seen is not None:
                 seen.clear()
                 seen.update(before)
-    return _collect(window_days, projects, base, seen, None)
+    return _collect(window_days, base, seen, None)
 
 
-def _collect(window_days, projects, base, seen, cache):
+def _collect(window_days, base, seen, cache):
     since = None
     if window_days:
         since = (datetime.now() - timedelta(days=window_days - 1)).date().isoformat()
@@ -330,11 +303,11 @@ def _collect(window_days, projects, base, seen, cache):
         if cache is not None:
             entry = cache.get(path, st)
             if entry is None:
-                records = read_log(path, projects)
+                records = read_log(path)
                 entry = cache.put(path, st, records)
             if entry["days"] is not None and seen.isdisjoint(entry["mids"]):
                 seen.update(entry["mids"])           # the fast way: every record counts
-                for key, (i, o, cw, cr, n, models, hours, projs) in entry["days"].items():
+                for key, (i, o, cw, cr, n, models, hours) in entry["days"].items():
                     if since and key < since:
                         continue
                     d = days[key]
@@ -347,15 +320,12 @@ def _collect(window_days, projects, base, seen, cache):
                         d["models"][k] += total
                     for k, total in hours:
                         d["hours"][k] += total
-                    if projects:
-                        for k, total in projs:
-                            d["projects"][k] += total
                 continue
             if records is None:
                 records = json.loads(entry["records"])
         if records is None:
-            records = read_log(path, projects)
-        for mid, key, hour, counts, model, project in records:   # the record-by-record way
+            records = read_log(path)
+        for mid, key, hour, counts, model in records:            # the record-by-record way
             if mid in seen:
                 continue
             seen.add(mid)
@@ -369,11 +339,9 @@ def _collect(window_days, projects, base, seen, cache):
             d["messages"] += 1
             d["models"][model or "unknown"] += total
             d["hours"][str(hour)] += total
-            if projects:
-                d["projects"][project if isinstance(project, str) else project_name(project)] += total
     for d in days.values():
         d["models"].pop("<synthetic>", None)
-        for k in ("models", "hours", "projects"):
+        for k in ("models", "hours"):
             d[k] = dict(d[k])
     return dict(sorted(days.items()))
 
@@ -421,14 +389,14 @@ class LogCache:
     corrupt, cut short, written by another version, Python or time zone) means an empty cache,
     so a full read, and it is replaced whole (written aside, then renamed), never edited."""
 
-    def __init__(self, path=None, projects=True):
-        self.path, self.projects = path or CACHE, projects
+    def __init__(self, path=None):
+        self.path = path or CACHE
         self.old, self.new = self._load(), {}
 
     def stamp(self):
         """What the records depend on besides the file: this collector's own code (its bytes,
-        not just VERSION), whether project names are kept, this Python's timestamp parsing, the
-        text encoding and the local time zone."""
+        not just VERSION, so a v11 cache, whose records held project names, is never read by v12),
+        this Python's timestamp parsing, the text encoding and the local time zone."""
         try:
             real = os.path.realpath("/etc/localtime")
             st = os.stat(real)
@@ -437,7 +405,7 @@ class LogCache:
             zone = None
         with open(os.devnull, errors="ignore") as fh:
             encoding = fh.encoding           # what read_log's open() decodes with
-        return [VERSION, own_sha256(), self.projects, list(sys.version_info[:2]), encoding,
+        return [VERSION, own_sha256(), list(sys.version_info[:2]), encoding,
                 os.environ.get("TZ"), list(time.tzname), time.timezone, time.altzone, zone]
 
     def _load(self):
@@ -640,8 +608,8 @@ def offer_new_dirs():
         answer = None
         for _ in range(3):
             try:
-                reply = input(f"Also count the Claude account in {short(path)}? Its tokens and project "
-                              "names go to your hero. [Y/n] ").strip().lower()
+                reply = input(f"Also count the Claude account in {short(path)}? Its tokens go to "
+                              "your hero. [Y/n] ").strip().lower()
             except EOFError:
                 break
             if reply in ("", "y", "yes", "n", "no"):
@@ -942,6 +910,17 @@ def is_wsl(version_file="/proc/version"):
         return False
 
 
+def machine_os(version_file="/proc/version"):
+    """The kind of computer, coarsely: "mac", "wsl", "windows" or "linux" (any other Unix too). Only
+    this word is sent, so Settings can name each machine for its owner; nothing else about the
+    system is. WSL is told apart the way is_wsl() does."""
+    if sys.platform == "darwin":
+        return "mac"
+    if sys.platform.startswith(("win", "cygwin", "msys")):
+        return "windows"
+    return "wsl" if is_wsl(version_file) else "linux"
+
+
 def on_windows_drive(path):
     """True for a folder on a Windows drive seen from WSL: /mnt/<drive letter>/..., after
     resolving symlinks, so a link from the Linux home to a Windows folder counts too. A Linux
@@ -979,7 +958,8 @@ def _install_hook_in(base, no_projects=False):
     hooks = settings.setdefault("hooks", {})
     if not isinstance(hooks, dict) or any(not isinstance(hooks.get(e, []), list) for e in HOOK_EVENTS):
         return f"tokenrpg: the \"hooks\" in {path} are not in the shape Claude Code uses; left it untouched."
-    # Someone who added --no-projects to our hooks by hand keeps it: a rerun never sends more.
+    # Someone who added --no-projects to our hooks by hand keeps it. Since v12 it changes nothing (no
+    # project names are read), but a rerun still never drops what a player chose.
     no_projects = no_projects or any(_ours(h) and "--no-projects" in str(h.get("command"))
                                      for e in HOOK_EVENTS for entry in hooks.get(e, [])
                                      if isinstance(entry, dict) and isinstance(entry.get("hooks"), list)
@@ -1038,7 +1018,7 @@ def _install_hook_in(base, no_projects=False):
     return None
 
 
-def add_dir(path, projects=True):
+def add_dir(path, no_projects=False):
     """Count a Claude account folder: remember it, hook it up (unless it is on a Windows drive)
     and upload its history (only its own, so no other folder's older days are re-sent)."""
     path = _canon(path)
@@ -1054,20 +1034,20 @@ def add_dir(path, projects=True):
              "counting it would count those days twice. Nothing changed.")
     _remember(path, True)
     say(f"✓ Counting {short(path)}.")
-    install_hook([path], no_projects=not projects)
+    install_hook([path], no_projects=no_projects)
     lock = upload_lock() if os.path.exists(CONFIG) else None
     try:
-        _add_dir_upload(path, projects)
+        _add_dir_upload(path)
     finally:
         if lock:
             lock.close()
 
 
-def _add_dir_upload(path, projects):
+def _add_dir_upload(path):
     if os.path.exists(CONFIG):
-        seen, days, cache = set(), {}, LogCache(projects=projects)
+        seen, days, cache = set(), {}, LogCache()
         for d in claude_dirs():          # earlier folders first, so they keep their messages
-            got = collect(0, projects=projects, base=d, seen=seen, cache=cache)
+            got = collect(0, base=d, seen=seen, cache=cache)
             if _ident(d) == _ident(path):
                 days = got
         cache.save()
@@ -1106,7 +1086,8 @@ def push(uploads):
     handle, latest = None, 0
     for folder, days in uploads:
         body = json.dumps({"days": days, "device": device(folder), "plan": plan(folder),
-                           "hooks": hooks_that_upload(folder), "client": f"tally_tokens/{VERSION}"}).encode()
+                           "hooks": hooks_that_upload(folder), "client": f"tally_tokens/{VERSION}",
+                           "os": machine_os()}).encode()
         try:
             status, raw = http(base + "/api/ingest", body,
                                {"Content-Type": "application/json", "Authorization": f"Bearer {token}"})
@@ -1145,7 +1126,9 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--days", type=int, default=28, help="window in days, 0 = everything (default 28)")
     ap.add_argument("--push", action="store_true", help="upload instead of printing")
-    ap.add_argument("--no-projects", action="store_true", help="don't send project folder names")
+    ap.add_argument("--no-projects", action="store_true",
+                    help="does nothing since v12, which never reads project names; still accepted, and kept "
+                         "by --install-hook in hook commands that have it, so older commands keep working")
     ap.add_argument("--quiet", action="store_true", help=f"write to {LOG} instead of the terminal")
     ap.add_argument("--install-hook", action="store_true",
                     help="add upload hooks to each Claude Code folder's settings.json (safe to re-run)")
@@ -1164,7 +1147,7 @@ def main():
         args.push = args.quiet = True
     QUIET = args.quiet
     if args.add_dir:
-        add_dir(args.add_dir, projects=not args.no_projects)
+        add_dir(args.add_dir, no_projects=args.no_projects)
         return
     if args.install_hook:
         install_hook(no_projects=args.no_projects)
@@ -1201,8 +1184,8 @@ def upload_lock():
 
 def collect_and_send(args):
     dirs, seen = claude_dirs(), set()
-    cache = None if args.no_cache else LogCache(projects=not args.no_projects)
-    per = [(d, collect(args.days, projects=not args.no_projects, base=d, seen=seen, cache=cache)) for d in dirs]
+    cache = None if args.no_cache else LogCache()
+    per = [(d, collect(args.days, base=d, seen=seen, cache=cache)) for d in dirs]
     if cache is not None and args.push:
         cache.save()                     # an upload keeps it; printing only reads it (no state from a look)
     if not args.push:

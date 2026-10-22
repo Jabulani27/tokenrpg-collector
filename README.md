@@ -13,24 +13,27 @@ exactly what runs on your machine.
 Numbers only, for each day:
 
 - tokens by type (input, output, cache writes, cache reads) and the number of messages;
-- tokens by model, by hour of the day, and by project folder name (the last folder of the working
-  directory, such as `my-app`, or `my-app/src` for a generic name). `--no-projects` leaves folder
-  names out.
+- tokens by model and by hour of the day.
+
+No project or folder names: until version 12 it also sent tokens by project folder name (the last folder of
+the working directory); version 12 ignores the working directory. `--no-projects` is still accepted, so older
+hook commands keep working, but changes nothing.
 
 With each upload it also sends:
 
 - the machine's id: a one-way SHA-256 hash of the OS machine id, your home folder and the Claude
   folder, so it says nothing about the machine;
 - a label: the computer's name, plus the account folder's name for any folder other than `~/.claude`;
+- the kind of computer, one word: `mac`, `linux`, `wsl` or `windows` (any other Unix is sent as `linux`);
 - your plan tier, from these fields only: `organizationType`, `organizationRateLimitTier`,
   `subscriptionCreatedAt` and `billingType` in `~/.claude.json`, or, on Linux, `subscriptionType` and
   `rateLimitTier` in `~/.claude/.credentials.json`;
 - the collector's version, and which of its own hooks (event names such as `Stop`) are installed.
 
-**Never sent:** your prompts, Claude's replies, code, file contents, file paths, or your Claude
-credentials or login tokens. Of the file that holds the login tokens, the script uses only the two
-plan fields above. It authenticates with its own TokenRPG upload token, never your Claude
-login.
+**Never sent:** your prompts, Claude's replies, code, file contents, file paths, the names of the
+folders you work in, or your Claude credentials or login tokens. Of the file that holds the login
+tokens, the script uses only the two plan fields above. It authenticates with its own TokenRPG
+upload token, never your Claude login.
 
 ## Install
 
