@@ -945,7 +945,8 @@ OS_VALUES = {"mac", "linux", "wsl", "windows"}
 # Exactly what an upload may hold (allow-listed, so a new key anywhere is a failure, not a pass).
 PAYLOAD_KEYS = {"days", "device", "plan", "hooks", "client", "os"}
 DAY_KEYS = {"input", "output", "cache_write", "cache_read", "messages", "models", "hours"}
-PLAN_KEYS = set(tt.PLAN_FIELDS) | {"subscriptionType", "rateLimitTier"}
+# Written out, not read from tt.PLAN_FIELDS, so a field added there fails here first. billingType went in v13 (audit L6).
+PLAN_KEYS = {"organizationType", "organizationRateLimitTier", "subscriptionCreatedAt", "subscriptionType", "rateLimitTier"}
 
 
 class NoProjectNames(Home):
@@ -1047,6 +1048,24 @@ class NoProjectNames(Home):
         self.assertEqual(err.getvalue(), "")                                      # not a crash and a fallback
         self.assertEqual(sent, self.run_cli("--push", "--days", "0", "--no-cache"))
         self.assertGreater(tt.VERSION, 11)
+
+
+class PlanFields(Home):
+    """v13 sends the plan badge's inputs only: billingType (sent until v12, never used) stays home."""
+
+    def test_billing_type_is_not_sent(self):
+        day = (date.today() - timedelta(days=2)).isoformat()
+        self.folder(".claude", dict(MAX5, subscriptionCreatedAt="2025-01-01T00:00:00Z", billingType="QQBILLQQ"),
+                    [usage_line("b1", f"{day}T12:00:00Z")])
+        bodies = self.run_cli("--push")
+        self.assertEqual(len(bodies), 1)
+        self.assertEqual(bodies[0]["plan"], dict(MAX5, subscriptionCreatedAt="2025-01-01T00:00:00Z"))
+        self.assertNotIn("QQBILLQQ", json.dumps(bodies))
+        self.assertLessEqual(set(tt.PLAN_FIELDS), PLAN_KEYS)
+
+    def test_user_agent_names_the_site(self):
+        self.assertEqual(tt.USER_AGENT, f"tokenrpg-collector/{tt.VERSION} (+https://tokenrpg.com)")
+        self.assertGreaterEqual(tt.VERSION, 13)
 
 
 class MachineOs(unittest.TestCase):

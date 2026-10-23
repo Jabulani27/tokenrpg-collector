@@ -1,6 +1,6 @@
 # TokenRPG collector
 
-[TokenRPG](https://tokenrpg.tinfoilhatsociety.cc) is an idle RPG for friends who use Claude Code: the
+[TokenRPG](https://tokenrpg.com) is an idle RPG for friends who use Claude Code: the
 tokens you spend move a hero up the Stack. This is the small script that runs on your computer. It
 reads the usage numbers Claude Code already writes to its own logs and uploads daily totals.
 
@@ -25,9 +25,9 @@ With each upload it also sends:
   folder, so it says nothing about the machine;
 - a label: the computer's name, plus the account folder's name for any folder other than `~/.claude`;
 - the kind of computer, one word: `mac`, `linux`, `wsl` or `windows` (any other Unix is sent as `linux`);
-- your plan tier, from these fields only: `organizationType`, `organizationRateLimitTier`,
-  `subscriptionCreatedAt` and `billingType` in `~/.claude.json`, or, on Linux, `subscriptionType` and
-  `rateLimitTier` in `~/.claude/.credentials.json`;
+- your plan tier, from these fields only: `organizationType`, `organizationRateLimitTier` and
+  `subscriptionCreatedAt` in `~/.claude.json`, or, on Linux, `subscriptionType` and `rateLimitTier` in
+  `~/.claude/.credentials.json` (until version 13 it also sent `billingType`, which the site never used or kept);
 - the collector's version, and which of its own hooks (event names such as `Stop`) are installed.
 
 **Never sent:** your prompts, Claude's replies, code, file contents, file paths, the names of the
@@ -37,7 +37,7 @@ upload token, never your Claude login.
 
 ## Install
 
-Sign up at [tokenrpg.tinfoilhatsociety.cc](https://tokenrpg.tinfoilhatsociety.cc) and follow
+Sign up at [tokenrpg.com](https://tokenrpg.com) and follow
 **Settings → Connect Claude Code**. Step 1 downloads this file to
 `~/.local/share/tokenrpg/tally_tokens.py`, step 2 uploads your history, and step 3 adds hooks so
 Claude Code uploads when a session starts or ends, and every few minutes while you work (after replies
@@ -55,7 +55,7 @@ Run it without `--push` to see exactly what it would send, as JSON, without send
 
 The site serves the same file as `collector/tally_tokens.py` here, byte for byte. Compare the two:
 
-    curl -fsSL https://tokenrpg.tinfoilhatsociety.cc/collector.py | sha256sum
+    curl -fsSL https://tokenrpg.com/collector.py | sha256sum
     sha256sum collector/tally_tokens.py
 
 On macOS, use `shasum -a 256` in place of `sha256sum`. The two lines should match. Your installed

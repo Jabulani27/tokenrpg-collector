@@ -3,11 +3,18 @@
 
 Reads ~/.claude/projects/**/*.jsonl, plus any other Claude account's folder the player chose
 (one per account, e.g. ~/.claude-work used through CLAUDE_CONFIG_DIR). Each folder uploads as
-its own machine row. Runs on Linux, macOS and WSL with any Python 3.9+. Only numbers, a machine label
-and the kind of computer leave this script (the label is the computer's name, plus the account folder's
-name, e.g. "claude-work"; the kind is mac, linux, wsl or windows; both are seen only by the player and the
-site admin): never prompts, code, file paths, the names of the folders you work in, or message content.
-Standard library only, so a friend can drop the single file anywhere.
+its own machine row. Runs on Linux, macOS and WSL with any Python 3.9+.
+
+An upload (v13) holds, for each day, tokens by type, the number of replies, tokens by model and
+tokens by hour; and once per folder: a machine id (a one-way hash), a label (the computer's name,
+plus the account folder's name when it isn't ~/.claude, e.g. "claude-work"), the kind of computer
+(mac, linux, wsl or windows), the plan fields in PLAN_FIELDS from .claude.json (when it has none,
+subscriptionType and rateLimitTier from .credentials.json, as Linux keeps them, never the login
+tokens beside them), which of our hooks the folder has (event names only) and this script's
+version. The label and the kind are seen only by the player and the site's admins. Never prompts,
+code, file contents, file paths, the names of the folders you work in (v12 stopped reading the
+working folder) or message content. Standard library only, so a friend can drop the single file
+anywhere.
 
   tally_tokens.py                 print the last 28 days as JSON (keyed by folder if there are several)
   tally_tokens.py --days 0        print everything still on disk
@@ -32,8 +39,8 @@ try:
 except ImportError:                  # not on native Windows, which isn't supported anyway
     fcntl = None
 
-VERSION = 12  # bump on every change; the server tells older copies to update themselves
-USER_AGENT = f"tokenrpg-collector/{VERSION} (+https://tokenrpg.tinfoilhatsociety.cc)"
+VERSION = 13  # bump on every change; the server tells older copies to update themselves
+USER_AGENT = f"tokenrpg-collector/{VERSION} (+https://tokenrpg.com)"
 HERE = os.path.abspath(__file__)
 LOG = os.path.join(os.path.dirname(HERE), "runs.log")
 CONFIG = os.environ.get("TOKENRPG_CONFIG") or os.path.expanduser("~/.config/tokenrpg/config.json")
@@ -681,7 +688,8 @@ def device(base=None):
 
 # ---------- which plan is this machine on? ----------
 
-PLAN_FIELDS = ("organizationType", "organizationRateLimitTier", "subscriptionCreatedAt", "billingType")
+# The plan badge's inputs, nothing else. billingType was sent until v12 and never used (audit L6): v13 doesn't read it.
+PLAN_FIELDS = ("organizationType", "organizationRateLimitTier", "subscriptionCreatedAt")
 
 
 def plan(base=None):
