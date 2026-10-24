@@ -4,6 +4,10 @@ import os
 
 os.environ["MAIL_ALLOWLIST"] = ("friend@example.com,player@example.com,admin@example.com,rob@example.com,"
                                 "someone@example.com,zzboss@x.com")
+# Round 6's launch day is the day the code first started on a database (app/db.py, first_start_day): every database
+# the suite makes records this fixed day instead, so no test depends on the day the suite happens to run. Tests about
+# the launch day itself set game.LAUNCH or this variable explicitly.
+os.environ.setdefault("TOKENRPG_FIRST_START", "2026-10-25")
 # Production sets SITE_URL, and account emails refuse to go without it outside debug and tests (accounts._base,
 # review L10): the suite runs like production, at the test client's own address.
 os.environ.setdefault("SITE_URL", "http://localhost")
