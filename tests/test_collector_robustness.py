@@ -70,19 +70,250 @@ class Robustness(unittest.TestCase):
             with self.assertRaises(urllib.error.URLError):
                 tt.http("http://example.invalid/")
 
-    def test_self_update_replaces_only_with_valid_python(self):
-        with tempfile.TemporaryDirectory() as d:
-            copy = os.path.join(d, "tally_tokens.py")
-            shutil.copy(SRC, copy)
-            tt = load(copy)
-            tt.QUIET, tt.LOG = True, os.path.join(d, "runs.log")
-            newer = re.sub(r"^VERSION = \d+", "VERSION = 99", open(SRC).read(), count=1, flags=re.M)
-            with mock.patch.object(tt, "http", return_value=(200, b"def main(:\n  broken")):
-                tt.self_update("http://x", 99)
-            self.assertNotIn("VERSION = 99", open(copy).read())   # broken download refused
-            with mock.patch.object(tt, "http", return_value=(200, newer.encode())):
-                tt.self_update("http://x", 99)
-            self.assertIn("VERSION = 99", open(copy).read())
+
+
+# The public copy every self-update is checked against (v14). Literal here too: changing the collector's is a decision.
+PUBLIC = "https://raw.githubusercontent.com/Jabulani27/tokenrpg-collector/main/collector/tally_tokens.py"
+
+
+def versioned(n, extra=""):
+    with open(SRC, "rb") as fh:
+        src = fh.read()
+    return re.sub(rb"^VERSION = \d+", b"VERSION = %d" % n, src, count=1, flags=re.M) + extra.encode()
+
+
+class WindowsCheckScripts(unittest.TestCase):
+    """Lawfix review LOW (second pass): the Windows test script downloaded the collector from tokenrpg.com and ran it.
+    Every script that fetches the collector must fetch PUBLIC_COPY, as Settings step 1 does."""
+
+    def test_windows_scripts_download_the_collector_from_github(self):
+        folder = os.path.join(HERE, "..", "windows-check")
+        if not os.path.isdir(folder):
+            self.skipTest("windows-check is not in the public copy")
+        public = load().PUBLIC_COPY
+        found = 0
+        for name in sorted(os.listdir(folder)):
+            if not name.endswith(".ps1"):
+                continue
+            with open(os.path.join(folder, name), encoding="utf-8-sig") as fh:
+                text = fh.read()
+            self.assertNotRegex(text, r"tokenrpg\.com/collector\.py", name)
+            for url in re.findall(r"\$CollectorUrl\s*=\s*'([^']*)'", text):
+                self.assertEqual(url, public, name)
+                found += 1
+        self.assertGreaterEqual(found, 1)
+
+
+class SelfUpdate(unittest.TestCase):
+    """v14: an update is installed only when the server's file declares the announced version, is byte-identical to
+    the public copy on GitHub and compiles. Every other case leaves the running file exactly as it was (fail closed),
+    says why once, and tries again on a later run."""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.dir, True)
+        self.copy = os.path.join(self.dir, "tally_tokens.py")
+        shutil.copy(SRC, self.copy)
+        with open(self.copy, "rb") as fh:
+            self.before = fh.read()
+        self.tt = load(self.copy)
+        self.tt.QUIET, self.tt.LOG = True, os.path.join(self.dir, "runs.log")
+        self.tt.UPDATE_SKIPPED = os.path.join(self.dir, "update-skipped")
+        self.answers, self.asked = {}, []
+
+    def http(self, url, data=None, headers=None):
+        self.asked.append(url)
+        answer = self.answers[url]
+        if isinstance(answer, Exception):
+            raise answer
+        return answer
+
+    def update(self, server, github, latest=99):
+        self.answers = {"https://server.example/collector.py": server, PUBLIC: github}
+        with mock.patch.object(self.tt, "http", side_effect=self.http):
+            self.tt.self_update("https://server.example", latest)
+
+    def running(self):
+        with open(self.copy, "rb") as fh:
+            return fh.read()
+
+    def log(self):
+        try:
+            with open(self.tt.LOG) as fh:
+                return fh.read()
+        except OSError:
+            return ""
+
+    def leftovers(self):
+        return sorted(n for n in os.listdir(self.dir) if n.startswith("tally_tokens.py."))
+
+    def assert_kept(self, why):
+        self.assertEqual(self.running(), self.before)
+        self.assertEqual(self.leftovers(), [])
+        self.assertIn(f"update to v99 skipped ({why}", self.log())
+
+    def test_install_writes_under_its_own_name_beside_the_file(self):
+        """Lawfix review LOW: a fixed tally_tokens.py.new let two runs updating at once write into, or install, each
+        other's half-written file, and a leftover .new that can't be opened blocked every update. Now the temp file is
+        in the same folder (so the swap is one rename) and named after this process."""
+        blocker = self.copy + ".new"
+        os.mkdir(blocker)                     # what a fixed name can't get past; also any other run's .new
+        replaced = []
+        real_replace = os.replace
+
+        def spy(src, dst):
+            replaced.append((src, dst))
+            return real_replace(src, dst)
+        new = versioned(99)
+        with mock.patch.object(self.tt.os, "replace", side_effect=spy):
+            self.update((200, new), (200, new))
+        self.assertEqual(self.running(), new)
+        self.assertEqual(len(replaced), 1)
+        tmp = replaced[0][0]
+        self.assertEqual(replaced[0][1], self.copy)
+        self.assertEqual(os.path.dirname(tmp), self.dir)
+        self.assertIn(f".{os.getpid()}.", os.path.basename(tmp))
+        self.assertEqual(self.leftovers(), ["tally_tokens.py.new"])          # the blocker, untouched
+
+    def test_install_flushes_the_temp_file_to_disk_before_the_swap(self):
+        """Lawfix review LOW (second pass): without fsync a power cut just after os.replace can leave an empty or
+        partial tally_tokens.py, and every hook then fails to start."""
+        order = []
+        real_fsync, real_replace = os.fsync, os.replace
+
+        def fsync(fd):
+            order.append(("fsync", os.readlink(f"/proc/self/fd/{fd}") if os.path.exists("/proc/self/fd") else fd))
+            return real_fsync(fd)
+
+        def replace(src, dst):
+            order.append(("replace", src))
+            return real_replace(src, dst)
+        new = versioned(99)
+        with mock.patch.object(self.tt.os, "fsync", side_effect=fsync), \
+                mock.patch.object(self.tt.os, "replace", side_effect=replace):
+            self.update((200, new), (200, new))
+        self.assertEqual(self.running(), new)
+        self.assertEqual([k for k, _ in order], ["fsync", "replace"])
+        if os.path.exists("/proc/self/fd"):
+            self.assertEqual(order[0][1], order[1][1])                    # the temp file itself, not some other fd
+
+    def test_install_sweeps_install_temps_left_over_an_hour_ago(self):
+        """A run killed between write and replace leaves tally_tokens.py.<pid>.tmp behind; the next install deletes
+        those over an hour old. A younger one may be another run's install in progress, so it stays."""
+        def make(name, age):
+            path = os.path.join(self.dir, name)
+            with open(path, "wb") as fh:
+                fh.write(b"half")
+            os.utime(path, (time.time() - age, time.time() - age))
+        make("tally_tokens.py.111.tmp", 7200)              # stale: swept
+        make("tally_tokens.py.222.tmp", 60)                # young: another run's, kept
+        make("tally_tokens.py.notes.tmp", 7200)            # not a pid temp: not ours to delete
+        make("other.py.333.tmp", 7200)                     # another file's: kept
+        new = versioned(99)
+        self.update((200, new), (200, new))
+        self.assertEqual(self.running(), new)
+        self.assertEqual(self.leftovers(), ["tally_tokens.py.222.tmp", "tally_tokens.py.notes.tmp"])
+        self.assertTrue(os.path.exists(os.path.join(self.dir, "other.py.333.tmp")))
+
+    def test_an_odd_skip_note_reads_as_not_skipped_lately(self):
+        """Lawfix review LOW: an 'at' too big for a float raised OverflowError out of the hook. Any odd note is "no"."""
+        odd = ['{"version": 99, "at": 1' + "0" * 400 + '}', '{"version": 99, "at": "soon"}', '{"version": 99}',
+               '{"version": 99, "at": [1]}', '[1, 2]', '"x"', 'not json', '\xff\xfe', "[" * 100000]
+        for text in odd:
+            with open(self.tt.UPDATE_SKIPPED, "w", encoding="latin-1") as fh:
+                fh.write(text)
+            self.assertFalse(self.tt._skipped_lately(99), text[:40])
+        new = versioned(99)
+        self.update((200, new), (200, new))                  # and the update still goes ahead
+        self.assertEqual(self.running(), new)
+
+    def test_the_public_copy_is_written_in_the_collector(self):
+        self.assertEqual(self.tt.PUBLIC_COPY, PUBLIC)
+        with open(SRC) as fh:
+            src = fh.read()
+        self.assertEqual(len(re.findall(r"PUBLIC_COPY\s*=(?!=)", src)), 1, "assigned once: nothing else may change it")
+        self.assertNotIn("global PUBLIC_COPY", src)
+
+    @unittest.skipUnless(os.path.exists(os.path.join(HERE, "..", "deploy.sh")), "deploy.sh is not in the public copy")
+    def test_the_public_copy_is_where_deploy_puts_the_collector(self):
+        with open(os.path.join(HERE, "..", "deploy.sh")) as fh:
+            deploy = fh.read()
+        repo = re.search(r"COLLECTOR_MIRROR_REMOTE:-git@github\.com:([\w.-]+/[\w.-]+?)\.git\}", deploy).group(1)
+        dest = re.search(r"^\s*collector/tally_tokens\.py:(\S+)$", deploy, re.M).group(1)
+        self.assertEqual(PUBLIC, f"https://raw.githubusercontent.com/{repo}/main/{dest}")
+
+    def test_applied_when_the_server_and_github_agree(self):
+        new = versioned(99)
+        self.update((200, new), (200, new))
+        self.assertEqual(self.running(), new)
+        self.assertEqual(self.asked, ["https://server.example/collector.py", PUBLIC])
+        self.assertIn("updated the collector from v", self.log())
+
+    def test_skipped_when_github_has_other_bytes(self):
+        self.update((200, versioned(99)), (200, versioned(99, "\n# one byte more\n")))
+        self.assert_kept("the server's file doesn't match the public copy on GitHub")
+
+    def test_skipped_when_github_is_unreachable(self):
+        self.update((200, versioned(99)), urllib.error.URLError("Name or service not known"))
+        self.assert_kept("can't reach the public copy on GitHub")
+
+    def test_skipped_when_github_has_no_such_file(self):
+        self.update((200, versioned(99)), (404, b"404: Not Found"))
+        self.assert_kept("the public copy on GitHub answered 404")
+
+    def test_skipped_when_the_file_is_not_the_announced_version(self):
+        for server_version in (98, 100):
+            new = versioned(server_version)
+            self.update((200, new), (200, new), latest=99)
+            self.assert_kept("the server's file is not v99")
+            os.unlink(self.tt.UPDATE_SKIPPED)                # or the second case would wait UPDATE_RETRY
+            os.unlink(self.tt.LOG)
+
+    def test_skipped_when_the_server_fails(self):
+        self.update(urllib.error.URLError("timed out"), (200, versioned(99)))
+        self.assert_kept("can't reach the server")
+        self.assertEqual(self.asked, ["https://server.example/collector.py"])
+
+    def test_still_refuses_invalid_python_both_sides_agree_on(self):
+        broken = b"VERSION = 99\ndef main(:\n  broken\n"
+        self.update((200, broken), (200, broken))
+        self.assert_kept("the file isn't valid Python")
+
+    def test_a_skip_is_logged_once_and_retried_later_not_on_every_upload(self):
+        """GitHub's raw files are cached for up to 5 minutes: a release can read as a mismatch for a while. A hook
+        uploads every 2 minutes; it must not fetch twice a time or fill runs.log, and must pick the release up."""
+        new = versioned(99)
+        stale = (200, self.before)
+        self.update((200, new), stale)
+        self.update((200, new), stale)                       # within UPDATE_RETRY: nothing fetched
+        self.assertEqual(len(self.asked), 2)
+        self.assertEqual(self.log().count("skipped"), 1)
+        with open(self.tt.UPDATE_SKIPPED) as fh:
+            note = json.load(fh)
+        note["at"] -= self.tt.UPDATE_RETRY + 1
+        with open(self.tt.UPDATE_SKIPPED, "w") as fh:
+            json.dump(note, fh)
+        self.update((200, new), stale)                       # tried again, the same reason not logged again
+        self.assertEqual(len(self.asked), 4)
+        self.assertEqual(self.log().count("skipped"), 1)
+        self.assertEqual(self.running(), self.before)
+        note["at"] -= self.tt.UPDATE_RETRY + 1
+        with open(self.tt.UPDATE_SKIPPED, "w") as fh:
+            json.dump(note, fh)
+        self.update((200, new), (200, new))                  # GitHub caught up
+        self.assertEqual(self.running(), new)
+        self.assertFalse(os.path.exists(self.tt.UPDATE_SKIPPED))
+
+    def test_a_newer_version_or_a_hand_run_is_tried_at_once(self):
+        stale = (200, self.before)
+        self.update((200, versioned(99)), stale)
+        self.update((200, versioned(100)), stale, latest=100)
+        self.assertEqual(len(self.asked), 4)
+        self.tt.QUIET = False
+        with mock.patch("builtins.print") as shown:
+            self.update((200, versioned(100)), stale, latest=100)
+        self.assertEqual(len(self.asked), 6)
+        self.assertIn("skipped", shown.call_args[0][0])
 
 
 class HookAsClaudeRunsIt(unittest.TestCase):

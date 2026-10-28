@@ -38,8 +38,9 @@ upload token, never your Claude login.
 ## Install
 
 Sign up at [tokenrpg.com](https://tokenrpg.com) and follow
-**Settings → Connect Claude Code**. Step 1 downloads this file to
-`~/.local/share/tokenrpg/tally_tokens.py`, step 2 uploads your history, and step 3 adds hooks so
+**Settings → Connect Claude Code**. Step 1 downloads this file from this repository (raw.githubusercontent.com)
+to `~/.local/share/tokenrpg/tally_tokens.py` and writes your config (the site's address and your upload token;
+that line is the only part the site fills in), step 2 uploads your history, and step 3 adds hooks so
 Claude Code uploads when a session starts or ends, and every few minutes while you work (after replies
 and tool calls, at most as often as the site's reply to each upload says, between 1 and 60 minutes).
 
@@ -58,9 +59,22 @@ The site serves the same file as `collector/tally_tokens.py` here, byte for byte
     curl -fsSL https://tokenrpg.com/collector.py | sha256sum
     sha256sum collector/tally_tokens.py
 
-On macOS, use `shasum -a 256` in place of `sha256sum`. The two lines should match. Your installed
-copy updates itself when a newer version comes out, so after an update compare
+On macOS, use `shasum -a 256` in place of `sha256sum`. The two lines should match.
+
+## Updates
+
+Your installed copy updates itself when the site has a newer version, and only to a file that is byte-identical
+to `collector/tally_tokens.py` in this repository, the same file step 1 installs. After an upload it downloads the site's file and this
+repository's copy (from raw.githubusercontent.com), and installs the new version only when the two match
+and the file is the version the site announced. Otherwise, or when GitHub can't be reached, it keeps the
+copy you have and tries again later. This is so since version 14; older versions updated from the site
+alone, so their update to version 14 is the last one made that way. After an update, compare
 `~/.local/share/tokenrpg/tally_tokens.py` too.
+
+Both the install and the update check download from GitHub, so GitHub sees your computer's IP address then.
+
+Version 14 also moves a config set up on the site's old address to https://tokenrpg.com, keeping
+everything else in it.
 
 ## Run the tests
 

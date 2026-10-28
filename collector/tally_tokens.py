@@ -29,6 +29,11 @@ de-duplicated on message id. The default 28-day window stays inside Claude Code'
 30-day log cleanup, so a partly deleted day is never sent over a complete one. Files
 unchanged since the last upload are not read again (log-cache.json beside the config,
 written by uploads only; printing reads it but never writes it).
+
+Step 1 on the site's Settings page downloads this file from the public copy on GitHub
+(github.com/Jabulani27/tokenrpg-collector); the site fills in only the config line. When the site has
+a newer version, an upload replaces this file with it, but only when the site's file is byte-identical
+to that public copy (since v14). Otherwise this file stays as it is and tries again later.
 """
 import os
 import sys
@@ -39,8 +44,17 @@ try:
 except ImportError:                  # not on native Windows, which isn't supported anyway
     fcntl = None
 
-VERSION = 13  # bump on every change; the server tells older copies to update themselves
+VERSION = 14  # bump on every change; the server tells older copies to update themselves
 USER_AGENT = f"tokenrpg-collector/{VERSION} (+https://tokenrpg.com)"
+# The public copy of this file, in the GitHub repository deploy.sh publishes it to. Step 1 on the Settings page
+# downloads this file from it (the site reads this line for the URL and fills in only the config line), and a
+# self-update installs a new version only when the server's file is byte-identical to it (v14). So both an install
+# and an update run the GitHub copy: the server can't change what runs here unless the GitHub copy changes too.
+# Written here on purpose: never taken from the config or from a server's reply.
+PUBLIC_COPY = "https://raw.githubusercontent.com/Jabulani27/tokenrpg-collector/main/collector/tally_tokens.py"
+# Configs written before 23 October 2026 name the site's old host. Every upload moves them to the new one (v14);
+# a config naming any other host (a test server, a dev box) is left exactly as it is.
+OLD_HOST, SITE = "tokenrpg.tinfoilhatsociety.cc", "https://tokenrpg.com"
 HERE = os.path.abspath(__file__)
 LOG = os.path.join(os.path.dirname(HERE), "runs.log")
 CONFIG = os.environ.get("TOKENRPG_CONFIG") or os.path.expanduser("~/.config/tokenrpg/config.json")
@@ -59,6 +73,10 @@ DEFAULT_EVERY, MIN_EVERY, MAX_EVERY = 120, 60, 3600
 # Each log file's usage records as last read (path, size, times, inode), so an upload re-reads
 # only the files that changed.
 CACHE = os.path.join(os.path.dirname(CONFIG), "log-cache.json")
+# The last self-update that was skipped: version, reason, when. A hook retries that version at most every
+# UPDATE_RETRY seconds and logs the same reason once (GitHub serves its files up to 5 minutes stale after a release).
+UPDATE_SKIPPED = os.path.join(os.path.dirname(CONFIG), "update-skipped")
+UPDATE_RETRY = 600
 # The Claude Code events that upload, and whether each is throttled to the server's rate. Stop
 # fires after every reply and PostToolUse after every tool call, so also during one long reply;
 # a session's start and end always upload. The hook commands carry no number.
@@ -790,20 +808,124 @@ def http(url, data=None, headers=None):
 
 # ---------- self-update ----------
 
+class UpdateSkipped(Exception):
+    """A self-update that can't go ahead; the message says why. This file is left as it was."""
+
+
 def self_update(base_url, latest):
-    import urllib.error
+    """Replace this file with version `latest` (the server's announced one), only when the file the server hands out
+    declares that version, is byte-identical (SHA-256) to PUBLIC_COPY and compiles. Anything else, GitHub unreachable
+    included, keeps this file: fail closed. A hook tries a skipped version again at most every UPDATE_RETRY seconds and
+    logs a reason once, so a release GitHub hasn't caught up with is simply picked up by a later run."""
+    if QUIET and _skipped_lately(latest):
+        return
     try:
-        status, body = http(base_url + "/collector.py")
-        if status != 200 or b"def main" not in body:
-            return say(f"tokenrpg: update to v{latest} skipped (download returned {status})")
+        install(verified_download(base_url, latest))
+    except UpdateSkipped as e:
+        return _skipped(latest, str(e))
+    try:
+        os.unlink(UPDATE_SKIPPED)
+    except OSError:
+        pass
+    say(f"tokenrpg: updated the collector from v{VERSION} to v{latest}")
+
+
+def verified_download(base_url, latest):
+    """The server's /collector.py, once it has passed every check. Raises UpdateSkipped."""
+    def get(url, where):
+        try:
+            status, body = http(url)
+        except Exception as e:  # noqa: BLE001 - unreachable, timed out, cut off: all mean "not now"
+            raise UpdateSkipped(f"can't reach {where}: {getattr(e, 'reason', e)}")
+        if status != 200:
+            raise UpdateSkipped(f"{where} answered {status}")
+        return body
+
+    body = get(base_url + "/collector.py", "the server")
+    m = re.search(rb"^VERSION = (\d+)", body, re.M)
+    if not m or int(m.group(1)) != latest:
+        raise UpdateSkipped(f"the server's file is not v{latest}")
+    public = get(PUBLIC_COPY, "the public copy on GitHub")
+    if hashlib.sha256(body).digest() != hashlib.sha256(public).digest():
+        raise UpdateSkipped("the server's file doesn't match the public copy on GitHub")
+    if b"def main" not in body:
+        raise UpdateSkipped("the file has no main()")
+    try:
         compile(body, "tally_tokens.py", "exec")  # refuse anything that isn't valid Python
-        tmp = HERE + ".new"
+    except (SyntaxError, ValueError) as e:
+        raise UpdateSkipped(f"the file isn't valid Python ({e})")
+    return body
+
+
+STALE_TMP = 3600   # seconds: an install temp file older than this was left by a run that died mid-write
+
+
+def sweep_install_temps():
+    """Delete `<this file>.<pid>.tmp` files over an hour old, left by a run killed between write and replace.
+    A younger one may be another run's install in progress, so it is left alone."""
+    for path in glob.glob(f"{glob.escape(HERE)}.*.tmp"):
+        if not path[len(HERE) + 1:-len(".tmp")].isdigit():
+            continue
+        try:
+            if time.time() - os.path.getmtime(path) > STALE_TMP:
+                os.unlink(path)
+        except OSError:
+            pass
+
+
+def install(body):
+    """Put `body` in place of this file: written beside it under a name of this process's own, flushed to disk, then
+    swapped in whole, so two runs updating at once never write into, or install, each other's half-written file, and
+    a power cut after the swap can't leave an empty or partial file in its place."""
+    sweep_install_temps()
+    tmp = f"{HERE}.{os.getpid()}.tmp"
+    try:
         with open(tmp, "wb") as fh:
             fh.write(body)
+            fh.flush()
+            os.fsync(fh.fileno())
         os.replace(tmp, HERE)
-        say(f"tokenrpg: updated the collector from v{VERSION} to v{latest}")
-    except (OSError, SyntaxError, urllib.error.URLError) as e:
-        say(f"tokenrpg: update to v{latest} skipped ({e})")
+    except OSError as e:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise UpdateSkipped(f"can't replace {HERE}: {e}")
+
+
+def _last_skip():
+    try:
+        with open(UPDATE_SKIPPED) as fh:
+            last = json.load(fh)
+        return last if isinstance(last, dict) else {}
+    except (OSError, ValueError, RecursionError):      # unreadable, not JSON, or nested past Python's limit
+        return {}
+
+
+def _skipped_lately(latest):
+    """True only for a readable note of this version skipped under UPDATE_RETRY ago; anything odd in it is "no"."""
+    last = _last_skip()
+    try:
+        return last.get("version") == latest and 0 <= time.time() - float(last.get("at")) < UPDATE_RETRY
+    except (TypeError, ValueError, OverflowError):     # OverflowError: an integer too big for a float
+        return False
+
+
+def _skipped(latest, reason):
+    """Say why (once per version and reason when run by a hook; always at the terminal) and note it."""
+    last = _last_skip()
+    if not QUIET or (last.get("version"), last.get("reason")) != (latest, reason):
+        say(f"tokenrpg: update to v{latest} skipped ({reason}); v{VERSION} keeps running and tries again later")
+    tmp = f"{UPDATE_SKIPPED}.{os.getpid()}.tmp"
+    try:
+        with open(tmp, "w") as fh:
+            json.dump({"version": latest, "reason": reason, "at": time.time()}, fh)
+        os.replace(tmp, UPDATE_SKIPPED)
+    except OSError:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
 
 
 # ---------- Claude Code hook ----------
@@ -1082,15 +1204,56 @@ def keep_rate(every):
         pass
 
 
+def move_host(cfg):
+    """The config's server URL, moved to SITE when it names exactly OLD_HOST: for this run, and in the file (written
+    whole, every other key kept, readable by you only). Any other host is returned exactly as written."""
+    import urllib.parse
+    url = cfg["url"]
+    try:
+        host = urllib.parse.urlsplit(url).hostname
+    except ValueError:
+        return url
+    if host != OLD_HOST:
+        return url
+    tmp = f"{CONFIG}.{os.getpid()}.tmp"
+    try:
+        with os.fdopen(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w") as fh:
+            json.dump(dict(cfg, url=SITE), fh)
+            fh.write("\n")
+        os.replace(tmp, CONFIG)
+        say(f"tokenrpg: {short(CONFIG)} now points at {SITE} (the site's new address)")
+    except OSError:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+    return SITE
+
+
+# What the player is told when an upload is refused, by HTTP status: our words, never the server's (lawfix review).
+STEP_1_AGAIN = ("copy step 1 from your Settings page again. Its download line must fetch "
+                f"{PUBLIC_COPY}, not a file from the site.")
+LATER = "a later upload sends these days again."
+REFUSED = {
+    400: "the server couldn't read this upload. Nothing was saved.",
+    403: "uploads are off for this account, or the request was blocked on its way. Nothing was saved.",
+    422: "the server refused these numbers (too many days, or more tokens in a day than Claude Code can use). "
+         "Nothing was saved.",
+    426: "this collector is out of date: " + STEP_1_AGAIN,
+    429: "too many uploads in the last hour. Nothing is lost: " + LATER,
+}
+REFUSED_OTHER = "Nothing was saved; " + LATER
+
+
 def push(uploads):
     """uploads: [(folder, days)]. One request per folder: each is its own machine row."""
     import urllib.error
     try:
         with open(CONFIG) as fh:
             cfg = json.load(fh)
-        base, token = cfg["url"].rstrip("/"), cfg["token"]
-    except (OSError, ValueError, KeyError) as e:
-        fail(f"tokenrpg: can't read {CONFIG}: {e}. Re-run step 1 from your Settings page.")
+        base, token = move_host(cfg).rstrip("/"), cfg["token"]
+    except (OSError, ValueError, KeyError, TypeError, AttributeError) as e:
+        fail(f"tokenrpg: can't read {CONFIG}: {e}. To fix it, " + STEP_1_AGAIN)
     handle, latest = None, 0
     for folder, days in uploads:
         body = json.dumps({"days": days, "device": device(folder), "plan": plan(folder),
@@ -1103,15 +1266,16 @@ def push(uploads):
             fail(f"tokenrpg: can't reach {base}: {getattr(e, 'reason', e)}")
         text = raw.decode(errors="ignore")
         if status == 401:
-            fail("tokenrpg: the server didn't recognise your upload token. Copy step 1 from your "
-                 "Settings page again (the token may have been reissued).")
+            fail("tokenrpg: the server didn't recognise your upload token (it may have been reissued): "
+                 + STEP_1_AGAIN)
+        # The server's own text is never printed (lawfix review): only the status and a fixed message of ours.
         if status != 200:
             hint = " (Cloudflare blocked the request)" if "error code: 10" in text else ""
-            fail(f"tokenrpg: upload refused ({status}){hint}: {text[:200]}")
+            fail(f"tokenrpg: upload refused ({status}){hint}: {REFUSED.get(status, REFUSED_OTHER)}")
         try:
             result = json.loads(text)
         except ValueError:
-            fail(f"tokenrpg: unexpected reply from the server: {text[:200]}")
+            fail(f"tokenrpg: unexpected reply from the server (not JSON). {REFUSED_OTHER}")
         skipped = result.get("skipped") or {}
         if skipped:
             say(f"tokenrpg: {len(skipped)} day(s) refused by the server: {skipped}")
@@ -1122,7 +1286,9 @@ def push(uploads):
         badge = f", {result['plan']}" if result.get("plan") else ""
         if LOG_UPLOADS:                  # not every 2 minutes' success: runs.log must cover days
             say(f"✓ Uploaded {n} day{'s' if n != 1 else ''} of Claude Code usage{span}{where}{badge}.")
-        latest = max(latest, result.get("collector_version") or 0)
+        announced = result.get("collector_version")
+        if isinstance(announced, int) and not isinstance(announced, bool):
+            latest = max(latest, announced)
     if not QUIET:
         say(f"  Your hero: {base}/u/{handle}")
     if latest > VERSION:
